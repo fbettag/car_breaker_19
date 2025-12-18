@@ -41,18 +41,23 @@ Car Breaker 19 is a research-only, receive-only application that samples Honda R
 ### Prerequisites
 - Flipper Zero running [Momentum Firmware](https://momentum-fw.dev/) (latest build recommended).
 - GNU build tooling available via the `./fbt` helper script.
+- This repository cloned into `Momentum-Firmware/applications_user/car_breaker19`.
 
 ### Install (direct launch)
 ```bash
 git clone https://github.com/Next-Flip/Momentum-Firmware.git
 cd Momentum-Firmware
+git clone https://github.com/fbettag/car_breaker_19.git applications_user/car_breaker19
 ./fbt launch APPSRC=applications_user/car_breaker19
 ```
 
 ### Manual build (.fap artifact)
 ```bash
+git clone https://github.com/Next-Flip/Momentum-Firmware.git
+cd Momentum-Firmware
+git clone https://github.com/fbettag/car_breaker_19.git applications_user/car_breaker19
 ./fbt fap_car_breaker19
-# Copy dist/f7-FW_TARGET/apps/User/car_breaker19.fap to /ext/apps_user/ on the Flipper.
+# Copy dist/f7-C/apps/Research/car_breaker19.fap to /ext/apps/Research/ on the Flipper.
 ```
 
 ### Using the App
@@ -88,4 +93,3 @@ All thresholds are derived from the timing, baud-rate, and FSK deviation analysi
 ## 📄 License
 
 Car Breaker 19 ships as part of Momentum Firmware and inherits the project’s [GPLv3 license](../../LICENSE).
-
