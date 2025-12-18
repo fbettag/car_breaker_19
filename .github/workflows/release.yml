@@ -1,0 +1,174 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for manual release (e.g., 1.0)'
+        required: false
+        default: 'manual'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        path: car_breaker19
+        fetch-depth: 0
+
+    - name: Checkout Momentum Firmware
+      uses: actions/checkout@v4
+      with:
+        repository: Next-Flip/Momentum-Firmware
+        path: momentum-firmware
+        submodules: recursive
+
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          python3 \
+          python3-pip \
+          python3-venv \
+          git \
+          make \
+          gcc-arm-none-eabi \
+          libnewlib-arm-none-eabi \
+          build-essential \
+          protobuf-compiler \
+          ccache
+
+    - name: Get version
+      id: version
+      run: |
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+          VERSION="v${{ github.event.inputs.version }}"
+        else
+          VERSION="v$(date +'%Y%m%d')-manual"
+        fi
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+        echo "Building version: $VERSION"
+
+    - name: Generate version files
+      run: |
+        cd car_breaker19
+        VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "${{ steps.version.outputs.VERSION }}")
+        echo "$VERSION" > VERSION
+        echo "const char* APP_VERSION_STR = \"$VERSION\";" > version.c
+        echo "extern const char* APP_VERSION_STR;" > version.h
+        cd ..
+
+    - name: Install app to firmware
+      run: |
+        mkdir -p momentum-firmware/applications_user/car_breaker19
+        cp car_breaker19/*.c momentum-firmware/applications_user/car_breaker19/
+        cp car_breaker19/*.h momentum-firmware/applications_user/car_breaker19/
+        cp car_breaker19/*.fam momentum-firmware/applications_user/car_breaker19/
+        cp car_breaker19/*.png momentum-firmware/applications_user/car_breaker19/ 2>/dev/null || true
+        cp -r car_breaker19/assets momentum-firmware/applications_user/car_breaker19/ 2>/dev/null || true
+        cp -r car_breaker19/scenes momentum-firmware/applications_user/car_breaker19/ 2>/dev/null || true
+
+    - name: Build application
+      run: |
+        cd momentum-firmware
+        ./fbt fap_car_breaker19
+
+    - name: Find and prepare release artifacts
+      id: artifacts
+      run: |
+        mkdir -p release
+        FAP_FILE=""
+        for path in \
+          "momentum-firmware/build/f7-firmware-C/.extapps/car_breaker19.fap" \
+          "momentum-firmware/build/f7-firmware-C/car_breaker19.fap" \
+          "momentum-firmware/dist/f7-C/apps/SubGHz/car_breaker19.fap" \
+          "momentum-firmware/dist/f7-C/apps/Research/car_breaker19.fap" \
+          "momentum-firmware/dist/f7-C/apps_data/car_breaker19.fap"; do
+          if [ -f "$path" ]; then
+            FAP_FILE="$path"
+            echo "Found .fap at: $FAP_FILE"
+            break
+          fi
+        done
+        if [ -z "$FAP_FILE" ]; then
+          FAP_FILE=$(find momentum-firmware -name "car_breaker19.fap" -type f 2>/dev/null | head -1)
+          if [ -n "$FAP_FILE" ]; then
+            echo "Found .fap via search: $FAP_FILE"
+          fi
+        fi
+        if [ -z "$FAP_FILE" ]; then
+          echo "ERROR: Could not find car_breaker19.fap"
+          exit 1
+        fi
+        VERSION="${{ steps.version.outputs.VERSION }}"
+        cp "$FAP_FILE" "release/car_breaker19_${VERSION}.fap"
+        cp "$FAP_FILE" "release/car_breaker19.fap"
+        cp car_breaker19/README.md release/
+        if [ -f car_breaker19/CHANGELOG.md ]; then
+          cp car_breaker19/CHANGELOG.md release/
+        fi
+        cd release
+        sha256sum *.fap > SHA256SUMS.txt
+        zip -r "car_breaker19_${VERSION}.zip" *.fap *.md SHA256SUMS.txt
+        ls -la
+
+    - name: Generate release notes
+      id: release_notes
+      run: |
+        VERSION="${{ steps.version.outputs.VERSION }}"
+        cat > release_notes.md << 'EOF'
+        ## Car Breaker 19 ${{ steps.version.outputs.VERSION }}
+
+        ### Installation
+
+        1. Download `car_breaker19_${{ steps.version.outputs.VERSION }}.fap`
+        2. Copy to your Flipper Zero SD card (e.g., `/ext/apps/Research/`)
+        3. Launch from Sub-GHz → Research → Car Breaker 19
+
+        ### Archive Installation
+
+        1. Download `car_breaker19_${{ steps.version.outputs.VERSION }}.zip`
+        2. Extract and copy the `.fap` file to your Flipper
+
+        ### Checksums
+
+        Verify the SHA256 sums provided in `SHA256SUMS.txt`.
+
+        ---
+        Built with Momentum Firmware
+        EOF
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.VERSION }}
+        name: Car Breaker 19 ${{ steps.version.outputs.VERSION }}
+        body_path: release_notes.md
+        files: |
+          release/car_breaker19_${{ steps.version.outputs.VERSION }}.fap
+          release/car_breaker19_${{ steps.version.outputs.VERSION }}.zip
+          release/SHA256SUMS.txt
+        generate_release_notes: true
+        draft: false
+        prerelease: false
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: car-breaker19-${{ steps.version.outputs.VERSION }}
+        path: |
+          release/*.fap
+          release/*.zip
+          release/SHA256SUMS.txt
