@@ -356,6 +356,42 @@ static void car_breaker_ui_timer_callback(void* context) {
     }
 }
 
+static void car_breaker_apply_preset(CarBreakerApp* app, uint8_t preset_idx) {
+    if(preset_idx < CAR_BREAKER_REAL_PRESETS_START || preset_idx >= CAR_BREAKER_PRESETS_COUNT) {
+        return;
+    }
+
+    if(subghz_worker_is_running(app->worker)) {
+        subghz_worker_stop(app->worker);
+        furi_hal_subghz_stop_async_rx();
+    }
+    furi_hal_subghz_idle();
+
+    const CarBreakerPreset* preset = &car_breaker_presets[preset_idx];
+    furi_hal_subghz_load_custom_preset(preset->regs);
+    furi_hal_subghz_set_frequency_and_path(preset->frequency);
+    furi_hal_subghz_flush_rx();
+    furi_hal_subghz_rx();
+
+    furi_hal_subghz_start_async_rx(subghz_worker_rx_callback, app->worker);
+    subghz_worker_start(app->worker);
+
+    app->current_hop_index = preset_idx;
+    app->capture_dirty = true;
+}
+
+static void car_breaker_hop_timer_callback(void* context) {
+    CarBreakerApp* app = context;
+    if(!app->capturing) return;
+
+    uint8_t next_idx = app->current_hop_index + 1;
+    if(next_idx >= CAR_BREAKER_PRESETS_COUNT) {
+        next_idx = CAR_BREAKER_REAL_PRESETS_START;
+    }
+
+    car_breaker_apply_preset(app, next_idx);
+}
+
 static void car_breaker_start_capture(CarBreakerApp* app) {
     if(app->capturing) return;
 
@@ -364,18 +400,30 @@ static void car_breaker_start_capture(CarBreakerApp* app) {
     furi_hal_subghz_reset();
     furi_hal_subghz_idle();
 
-    const CarBreakerPreset* preset = &car_breaker_presets[app->preset_index];
-    furi_hal_subghz_load_custom_preset(preset->regs);
-    furi_hal_subghz_set_frequency_and_path(preset->frequency);
-    furi_hal_subghz_flush_rx();
-    furi_hal_subghz_rx();
-
     subghz_worker_set_context(app->worker, app);
     subghz_worker_set_pair_callback(app->worker, car_breaker_worker_pair_callback);
     subghz_worker_set_overrun_callback(app->worker, car_breaker_worker_overrun_callback);
 
-    furi_hal_subghz_start_async_rx(subghz_worker_rx_callback, app->worker);
-    subghz_worker_start(app->worker);
+    if(app->preset_index == CAR_BREAKER_PRESET_HOPPING) {
+        app->current_hop_index = CAR_BREAKER_REAL_PRESETS_START;
+        car_breaker_apply_preset(app, app->current_hop_index);
+
+        if(!app->hop_timer) {
+            app->hop_timer =
+                furi_timer_alloc(car_breaker_hop_timer_callback, FuriTimerTypePeriodic, app);
+        }
+        furi_timer_start(app->hop_timer, furi_ms_to_ticks(CAR_BREAKER_HOP_INTERVAL_MS));
+    } else {
+        app->current_hop_index = app->preset_index;
+        const CarBreakerPreset* preset = &car_breaker_presets[app->preset_index];
+        furi_hal_subghz_load_custom_preset(preset->regs);
+        furi_hal_subghz_set_frequency_and_path(preset->frequency);
+        furi_hal_subghz_flush_rx();
+        furi_hal_subghz_rx();
+
+        furi_hal_subghz_start_async_rx(subghz_worker_rx_callback, app->worker);
+        subghz_worker_start(app->worker);
+    }
 
     app->pulse_count = 0;
     app->capturing = true;
@@ -390,6 +438,10 @@ static void car_breaker_start_capture(CarBreakerApp* app) {
 
 static void car_breaker_stop_capture(CarBreakerApp* app) {
     if(!app->capturing) return;
+
+    if(app->hop_timer) {
+        furi_timer_stop(app->hop_timer);
+    }
 
     if(subghz_worker_is_running(app->worker)) {
         subghz_worker_stop(app->worker);
@@ -452,13 +504,22 @@ static void car_breaker_capture_view_draw(Canvas* canvas, void* model) {
     canvas_clear(canvas);
 
     canvas_set_font(canvas, FontPrimary);
-    char header[32];
-    snprintf(
-        header,
-        sizeof(header),
-        "%s: %s",
-        capturing ? "Capturing" : "Paused",
-        car_breaker_presets[app->preset_index].name);
+    char header[40];
+    if(app->preset_index == CAR_BREAKER_PRESET_HOPPING) {
+        snprintf(
+            header,
+            sizeof(header),
+            "%s: Hop %s",
+            capturing ? "Capturing" : "Paused",
+            car_breaker_presets[app->current_hop_index].name);
+    } else {
+        snprintf(
+            header,
+            sizeof(header),
+            "%s: %s",
+            capturing ? "Capturing" : "Paused",
+            car_breaker_presets[app->preset_index].name);
+    }
     canvas_draw_str_aligned(canvas, 64, 2, AlignCenter, AlignTop, header);
 
     canvas_set_color(canvas, ColorWhite);
@@ -807,6 +868,10 @@ static void car_breaker_free(CarBreakerApp* app) {
 
     if(app->ui_timer) {
         furi_timer_free(app->ui_timer);
+    }
+
+    if(app->hop_timer) {
+        furi_timer_free(app->hop_timer);
     }
 
     view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewAbout);
