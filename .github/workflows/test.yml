@@ -155,16 +155,17 @@ jobs:
 
     - name: Check code formatting
       run: |
-        cd applications_user/car_breaker19
-        find . -name "*.c" -o -name "*.h" | xargs clang-format --dry-run --Werror || true
+        # Check C files for formatting issues
+        find . -name "*.c" -o -name "*.h" | grep -v ".git" | grep -v "tests/unity" | xargs clang-format --dry-run --Werror || true
 
     - name: Run static analysis
       run: |
-        cd applications_user/car_breaker19
+        echo "🔍 Running static analysis..."
         cppcheck --enable=all --error-exitcode=1 --suppress=missingIncludeSystem \
           --suppress=unusedFunction --suppress=unmatchedSuppression \
           --suppress=missingInclude --force \
           *.c *.h 2> cppcheck_report.txt || true
+
         if [ -s cppcheck_report.txt ]; then
           echo "⚠️ Static analysis found issues:"
           cat cppcheck_report.txt
@@ -174,16 +175,23 @@ jobs:
 
     - name: Check for common issues
       run: |
-        cd applications_user/car_breaker19
+        echo "🔍 Running code quality checks..."
+
+        # Check for buffer overflow patterns
         if grep -r "[^a-zA-Z_]gets(" --include="*.c" --include="*.h" .; then
           echo "❌ Found unsafe gets() function"
           exit 1
         fi
+
+        # Check memory allocation patterns
         echo "Checking malloc patterns..."
         grep -n "malloc\|calloc\|realloc\|free" *.c || echo "No memory operations found"
+
+        # Check for potential null pointer dereferences
         echo "Checking for null pointer issues..."
         cppcheck --enable=warning --error-exitcode=0 *.c 2> null_check.txt || true
         grep -i "null" null_check.txt || echo "No null pointer issues found"
+
         echo "✅ Code quality checks completed"
 
   security-scan:
@@ -194,20 +202,30 @@ jobs:
 
     - name: Run security checks
       run: |
-        cd applications_user/car_breaker19
+        echo "🔐 Running security analysis..."
+
+        # Basic security checks - exact match for unsafe gets() function
         if grep -r "[^a-zA-Z_]gets(" --include="*.c" --include="*.h" .; then
           echo "❌ Found unsafe gets() function"
           exit 1
         fi
+
+        # Check for buffer overflows
         if grep -r "strcpy\|strcat\|sprintf\|scanf" --include="*.c" . | grep -v "strncpy\|strncat\|snprintf"; then
           echo "⚠️ Found potentially unsafe string functions"
         fi
+
+        # Check for integer overflows
+        echo "Checking for potential integer overflows..."
         if grep -rE "malloc\([^)]*\*[^)]*\)" --include="*.c" .; then
           echo "ℹ️ Found multiplication in malloc - ensure bounds checking"
         fi
+
+        # Check for format string vulnerabilities
         if grep -rE "printf\([^\"]*\);" --include="*.c" | grep -v "printf\(\""; then
           echo "⚠️ Potential format string vulnerability"
         fi
+
         echo "✅ Security checks completed"
 
   test-summary:
