@@ -7,7 +7,6 @@
 #include <gui/view_dispatcher.h>
 #include <gui/elements.h>
 #include <gui/modules/submenu.h>
-#include <gui/modules/variable_item_list.h>
 #include <gui/modules/dialog_ex.h>
 #include <input/input.h>
 #include <lib/subghz/subghz_worker.h>
@@ -17,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "scenes/car_breaker19_scene_about.h"
 
@@ -31,21 +31,53 @@
 #define CAR_BREAKER_ROLLBACK_GAP_MS 8000
 #define CAR_BREAKER_STATUS_MSG_LEN 64
 #define KEY_DEBOUNCE_MS 300
-#define CAR_BREAKER_HOP_INTERVAL_MS 500
-#define CAR_BREAKER_PRESET_HOPPING 0
 #define CAR_BREAKER_ROLLING_SEQUENCE_LEN 5
 #define CAR_BREAKER_MIN_FRAME_BITS 40
 #define CAR_BREAKER_MAX_FRAME_BITS 160
 #define CAR_BREAKER_MIN_FRAME_DURATION_US 3000
 #define CAR_BREAKER_MAX_FRAME_DURATION_US 14000
 #define CAR_BREAKER_CONSISTENCY_TOLERANCE_PERCENT 18
+#define CAR_BREAKER_MAX_BIT_COUNT (CAR_BREAKER_MAX_PULSES / 2)
+#define CAR_BREAKER_HITAG2_MIN_BITS 100
+#define CAR_BREAKER_HITAG2_MAX_BITS 128
+#define CAR_BREAKER_HITAG2_WINDOW 16
+#define CAR_BREAKER_HITAG2_MIN_SAMPLES 4
+#define CAR_BREAKER_HITAG2_ENTROPY_WARN 7.0f
+#define CAR_BREAKER_HITAG2_ENTROPY_CRIT 4.0f
 
 typedef struct CarBreakerApp CarBreakerApp;
+
+typedef enum {
+    CarBreakerRegionUSA = 0,
+    CarBreakerRegionEU,
+    CarBreakerRegionEU868,
+} CarBreakerRegion;
+
+typedef enum {
+    CarBreakerProfileHondaLegacy = 0,
+    CarBreakerProfileHondaModern,
+    CarBreakerProfileMiniCas3,
+} CarBreakerProfile;
 
 typedef struct {
     uint32_t duration;
     uint8_t level;
 } CarBreakerPulse;
+
+typedef struct {
+    uint32_t uid;
+    uint16_t counter_low;
+    uint8_t button;
+    uint32_t keystream;
+    uint8_t pad_bits;
+    uint8_t checksum;
+    bool checksum_valid;
+} CarBreakerHitag2Decoded;
+
+typedef struct {
+    uint32_t keystream;
+    uint16_t counter_low;
+} CarBreakerHitag2Sample;
 
 typedef struct {
     uint32_t timestamp_ms;
@@ -54,6 +86,12 @@ typedef struct {
     uint16_t approx_bits;
     uint32_t duration_us;
     uint8_t preset_index;
+    bool hitag2_decoded;
+    bool hitag2_checksum_valid;
+    uint32_t hitag2_uid;
+    uint16_t hitag2_counter_low;
+    uint8_t hitag2_button;
+    uint32_t hitag2_keystream;
 } CarBreakerFrame;
 
 typedef struct {
@@ -71,6 +109,16 @@ typedef struct {
     uint32_t rollback_gap_ms;
     bool rolling_pwn_detected;
     uint32_t rolling_window_ms;
+    bool hitag2_activity;
+    bool hitag2_entropy_low;
+    bool hitag2_entropy_critical;
+    bool hitag2_keystream_repeat;
+    bool hitag2_counter_regression;
+    uint8_t hitag2_window_size;
+    uint32_t hitag2_uid;
+    uint16_t hitag2_last_counter;
+    uint32_t hitag2_last_keystream;
+    float hitag2_entropy_bits_per_byte;
 } CarBreakerAnalysis;
 
 typedef struct {
@@ -81,7 +129,19 @@ typedef struct {
     const char* description;
 } CarBreakerPreset;
 
+static void car_breaker_start_capture(CarBreakerApp* app);
 static void car_breaker_stop_capture(CarBreakerApp* app);
+static bool car_breaker_try_decode_hitag2(
+    CarBreakerFrame* frame,
+    const CarBreakerPulse* pulses,
+    uint16_t pulse_count);
+static float car_breaker_compute_entropy_bits_per_byte(const uint16_t* hist, uint16_t total_bytes);
+static void car_breaker_show_region_menu(CarBreakerApp* app);
+static void car_breaker_show_profile_menu(CarBreakerApp* app);
+static void car_breaker_region_menu_callback(void* context, uint32_t index);
+static void car_breaker_profile_menu_callback(void* context, uint32_t index);
+static uint32_t car_breaker_region_previous_callback(void* context);
+static uint32_t car_breaker_profile_previous_callback(void* context);
 
 static const uint8_t car_breaker_preset_hnd1[] = {
     0x02, 0x0D, 0x0B, 0x06, 0x08, 0x32, 0x07, 0x04, 0x14, 0x00, 0x13, 0x02,
@@ -96,20 +156,6 @@ static const uint8_t car_breaker_preset_hnd2[] = {
     0x1D, 0x92, 0x1C, 0x40, 0x1B, 0x03, 0x20, 0xFB, 0x22, 0x10, 0x21, 0x56,
     0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
-
-typedef enum {
-    CarBreakerModeHopping = 0,
-    CarBreakerMode433,
-    CarBreakerMode315,
-} CarBreakerMode;
-
-typedef enum {
-    CarBreakerFilterWide = 0,
-    CarBreakerFilterNarrow,
-} CarBreakerFilter;
-
-static const char* car_breaker_mode_names[] = {"Hopping", "433.92 MHz", "315 MHz"};
-static const char* car_breaker_filter_names[] = {"Wide", "Narrow"};
 
 static const CarBreakerPreset car_breaker_presets[] = {
     {
@@ -140,21 +186,47 @@ static const CarBreakerPreset car_breaker_presets[] = {
         .regs_size = sizeof(car_breaker_preset_hnd2),
         .description = "315 MHz narrow filter",
     },
+    {
+        .name = "868 Wide",
+        .frequency = 868350000,
+        .regs = car_breaker_preset_hnd1,
+        .regs_size = sizeof(car_breaker_preset_hnd1),
+        .description = "868.35 MHz wide filter",
+    },
+    {
+        .name = "868 Narrow",
+        .frequency = 868350000,
+        .regs = car_breaker_preset_hnd2,
+        .regs_size = sizeof(car_breaker_preset_hnd2),
+        .description = "868.35 MHz narrow filter",
+    },
 };
 
 #define CAR_BREAKER_PRESETS_COUNT (COUNT_OF(car_breaker_presets))
 
+static const char* car_breaker_region_names[] = {
+    "USA 315 MHz",
+    "EU 433.92 MHz",
+    "EU 868 MHz",
+};
+
+static const char* car_breaker_profile_names[] = {
+    "Honda Legacy (HND1)",
+    "Honda Modern (HND2)",
+    "Mini CAS3 Hitag2",
+};
+
 typedef enum {
     CarBreakerViewSplash,
     CarBreakerViewMenu,
-    CarBreakerViewConfig,
     CarBreakerViewCapture,
     CarBreakerViewAbout,
+    CarBreakerViewRegionSelect,
+    CarBreakerViewProfileSelect,
 } CarBreakerView;
 
 typedef enum {
     CarBreakerMenuStart,
-    CarBreakerMenuConfig,
     CarBreakerMenuAbout,
 } CarBreakerMenuIndex;
 
@@ -162,7 +234,8 @@ struct CarBreakerApp {
     Gui* gui;
     ViewDispatcher* view_dispatcher;
     Submenu* submenu;
-    VariableItemList* config_list;
+    Submenu* region_menu;
+    Submenu* profile_menu;
     DialogEx* splash_dialog;
     DialogEx* capture_dialog;
     View* about_view;
@@ -173,16 +246,17 @@ struct CarBreakerApp {
     FuriMutex* lock;
     SubGhzWorker* worker;
     FuriTimer* ui_timer;
-    FuriTimer* hop_timer;
 
     CarBreakerSession session;
     CarBreakerAnalysis analysis;
     CarBreakerPulse pulses[CAR_BREAKER_MAX_PULSES];
     uint16_t pulse_count;
 
-    CarBreakerMode mode;
-    CarBreakerFilter filter;
     uint8_t current_preset_index;
+    CarBreakerRegion selected_region;
+    CarBreakerProfile selected_profile;
+    bool selection_ready;
+    bool pending_capture;
     bool capturing;
     bool capture_dirty;
     bool overrun;
@@ -191,14 +265,6 @@ struct CarBreakerApp {
     char status_message[CAR_BREAKER_STATUS_MSG_LEN];
     CarBreakerView active_view;
 };
-
-static uint8_t car_breaker_get_preset_index(CarBreakerMode mode, CarBreakerFilter filter) {
-    if(mode == CarBreakerMode433) {
-        return (filter == CarBreakerFilterWide) ? 0 : 1;
-    } else {
-        return (filter == CarBreakerFilterWide) ? 2 : 3;
-    }
-}
 
 static bool car_breaker_is_key_debounced(CarBreakerApp* app) {
     if(!app) return false;
@@ -264,6 +330,241 @@ static uint32_t car_breaker_percent_delta(uint32_t baseline, uint32_t value) {
     return (diff * 100u) / baseline;
 }
 
+static float car_breaker_log2_approx(float value) {
+    if(value <= 0.0f) {
+        return 0.0f;
+    }
+    return logf(value) / 0.6931471805599453f;
+}
+
+static uint64_t car_breaker_bits_to_value_msb(const uint8_t* bits, size_t count) {
+    uint64_t value = 0;
+    for(size_t i = 0; i < count; i++) {
+        value = (value << 1) | (bits[i] ? 1u : 0u);
+    }
+    return value;
+}
+
+static uint64_t car_breaker_bits_to_value_lsb(const uint8_t* bits, size_t count) {
+    uint64_t value = 0;
+    for(size_t i = 0; i < count; i++) {
+        if(bits[i]) {
+            value |= (1ULL << i);
+        }
+    }
+    return value;
+}
+
+static bool car_breaker_extract_hitag2_bits(
+    const CarBreakerPulse* pulses,
+    uint16_t pulse_count,
+    uint8_t* bit_buffer,
+    size_t* bit_count_out) {
+    if(pulse_count < CAR_BREAKER_HITAG2_MIN_BITS * 2 || (pulse_count % 2) != 0 ||
+       pulse_count > CAR_BREAKER_MAX_BIT_COUNT * 2) {
+        return false;
+    }
+
+    uint64_t duration_total = 0;
+    for(uint16_t i = 0; i < pulse_count; i++) {
+        duration_total += pulses[i].duration;
+    }
+    if(duration_total == 0) {
+        return false;
+    }
+
+    uint32_t avg_half = duration_total / pulse_count;
+    if(avg_half < 80 || avg_half > 3000) {
+        return false;
+    }
+    uint32_t min_allowed = (avg_half > 40) ? (avg_half - avg_half / 2) : 0;
+    uint32_t max_allowed = avg_half + avg_half / 2 + 150;
+
+    size_t bits_written = 0;
+    for(uint16_t i = 0; i + 1 < pulse_count; i += 2) {
+        const CarBreakerPulse* first = &pulses[i];
+        const CarBreakerPulse* second = &pulses[i + 1];
+
+        if(first->level == second->level) {
+            return false;
+        }
+
+        if(first->duration < min_allowed || first->duration > max_allowed ||
+           second->duration < min_allowed || second->duration > max_allowed) {
+            return false;
+        }
+
+        if(bits_written >= CAR_BREAKER_MAX_BIT_COUNT) {
+            return false;
+        }
+
+        if(first->level == 1 && second->level == 0) {
+            bit_buffer[bits_written++] = 1;
+        } else if(first->level == 0 && second->level == 1) {
+            bit_buffer[bits_written++] = 0;
+        } else {
+            return false;
+        }
+    }
+
+    if(bits_written < CAR_BREAKER_HITAG2_MIN_BITS || bits_written > CAR_BREAKER_HITAG2_MAX_BITS) {
+        return false;
+    }
+
+    *bit_count_out = bits_written;
+    return true;
+}
+
+static bool car_breaker_parse_hitag2_from_offset(
+    const uint8_t* bits,
+    size_t available_bits,
+    CarBreakerHitag2Decoded* decoded) {
+    if(available_bits < 104) {
+        return false;
+    }
+
+    uint16_t sync = (uint16_t)car_breaker_bits_to_value_msb(bits, 16);
+    if(!(sync == 0x0001u || sync == 0x5555u || sync == 0xAAAAu)) {
+        return false;
+    }
+
+    const uint8_t* payload = bits + 16;
+    const size_t payload_bits = 88;
+
+    uint32_t uid = (uint32_t)car_breaker_bits_to_value_msb(payload, 32);
+    uint8_t button = (uint8_t)car_breaker_bits_to_value_msb(payload + 32, 4);
+    uint16_t counter_low = (uint16_t)car_breaker_bits_to_value_msb(payload + 36, 10);
+    uint32_t keystream = (uint32_t)car_breaker_bits_to_value_lsb(payload + 46, 32);
+    uint8_t pad_bits = (uint8_t)car_breaker_bits_to_value_msb(payload + 78, 2);
+    uint8_t checksum = (uint8_t)car_breaker_bits_to_value_msb(payload + 80, 8);
+
+    uint8_t payload_bytes[11] = {0};
+    for(size_t i = 0; i < payload_bits; i++) {
+        size_t byte_idx = i / 8;
+        payload_bytes[byte_idx] = (payload_bytes[byte_idx] << 1) | (payload[i] ? 1u : 0u);
+    }
+
+    uint8_t calculated = 0;
+    for(size_t i = 0; i < 10; i++) {
+        calculated ^= payload_bytes[i];
+    }
+
+    decoded->uid = uid;
+    decoded->button = button;
+    decoded->counter_low = counter_low;
+    decoded->keystream = keystream;
+    decoded->pad_bits = pad_bits;
+    decoded->checksum = checksum;
+    decoded->checksum_valid = (pad_bits == 0b10u) && (calculated == checksum);
+
+    return true;
+}
+
+static bool car_breaker_try_decode_hitag2(
+    CarBreakerFrame* frame,
+    const CarBreakerPulse* pulses,
+    uint16_t pulse_count) {
+    if(!frame || !pulses || pulse_count < CAR_BREAKER_HITAG2_MIN_BITS * 2) {
+        return false;
+    }
+
+    uint8_t bit_buffer[CAR_BREAKER_MAX_BIT_COUNT] = {0};
+    size_t bit_count = 0;
+    if(!car_breaker_extract_hitag2_bits(pulses, pulse_count, bit_buffer, &bit_count)) {
+        return false;
+    }
+
+    for(size_t offset = 0; offset + 104 <= bit_count; offset++) {
+        CarBreakerHitag2Decoded decoded = {0};
+        if(car_breaker_parse_hitag2_from_offset(&bit_buffer[offset], bit_count - offset, &decoded)) {
+            frame->hitag2_decoded = true;
+            frame->hitag2_checksum_valid = decoded.checksum_valid;
+            frame->hitag2_uid = decoded.uid;
+            frame->hitag2_counter_low = decoded.counter_low;
+            frame->hitag2_button = decoded.button;
+            frame->hitag2_keystream = decoded.keystream;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static float car_breaker_compute_entropy_bits_per_byte(const uint16_t* hist, uint16_t total_bytes) {
+    if(!hist || total_bytes == 0) {
+        return 0.0f;
+    }
+    float entropy = 0.0f;
+    for(uint16_t i = 0; i < 256; i++) {
+        if(hist[i] == 0) continue;
+        float probability = (float)hist[i] / (float)total_bytes;
+        entropy -= probability * car_breaker_log2_approx(probability);
+    }
+    return entropy;
+}
+
+static uint8_t car_breaker_select_preset_index(CarBreakerRegion region, CarBreakerProfile profile) {
+    const bool narrow = (profile != CarBreakerProfileHondaLegacy);
+    if(region == CarBreakerRegionUSA) {
+        return narrow ? 3 : 2;
+    } else if(region == CarBreakerRegionEU) {
+        return narrow ? 1 : 0;
+    } else { // CarBreakerRegionEU868
+        return narrow ? 5 : 4;
+    }
+}
+
+static void car_breaker_show_region_menu(CarBreakerApp* app) {
+    if(!app) return;
+    submenu_set_selected_item(app->region_menu, app->selected_region);
+    car_breaker_safe_switch_view(app, CarBreakerViewRegionSelect);
+}
+
+static void car_breaker_show_profile_menu(CarBreakerApp* app) {
+    if(!app) return;
+    submenu_set_selected_item(app->profile_menu, app->selected_profile);
+    car_breaker_safe_switch_view(app, CarBreakerViewProfileSelect);
+}
+
+static void car_breaker_region_menu_callback(void* context, uint32_t index) {
+    CarBreakerApp* app = context;
+    if(index >= COUNT_OF(car_breaker_region_names)) {
+        index = 0;
+    }
+    app->selected_region = (CarBreakerRegion)index;
+    car_breaker_show_profile_menu(app);
+}
+
+static void car_breaker_profile_menu_callback(void* context, uint32_t index) {
+    CarBreakerApp* app = context;
+    if(index >= COUNT_OF(car_breaker_profile_names)) {
+        index = 0;
+    }
+    app->selected_profile = (CarBreakerProfile)index;
+    app->current_preset_index =
+        car_breaker_select_preset_index(app->selected_region, app->selected_profile);
+    app->selection_ready = true;
+    bool start_now = app->pending_capture;
+    app->pending_capture = false;
+    if(start_now) {
+        car_breaker_start_capture(app);
+        car_breaker_safe_switch_view(app, CarBreakerViewCapture);
+    } else {
+        car_breaker_safe_switch_view(app, CarBreakerViewMenu);
+    }
+}
+
+static uint32_t car_breaker_region_previous_callback(void* context) {
+    CarBreakerApp* app = context;
+    app->pending_capture = false;
+    return CarBreakerViewMenu;
+}
+
+static uint32_t car_breaker_profile_previous_callback(void* context) {
+    UNUSED(context);
+    return CarBreakerViewRegionSelect;
+}
+
 static bool car_breaker_frames_consistent(
     const CarBreakerFrame* reference,
     const CarBreakerFrame* candidate) {
@@ -287,10 +588,33 @@ static bool car_breaker_frames_consistent(
 static void car_breaker_recompute_analysis_locked(CarBreakerApp* app) {
     CarBreakerAnalysis updated = {0};
     const CarBreakerSession* session = &app->session;
+    CarBreakerHitag2Sample hitag2_samples[CAR_BREAKER_HITAG2_WINDOW] = {0};
+    size_t hitag2_sample_count = 0;
+    bool hitag2_uid_set = false;
+    uint32_t hitag2_uid = 0;
 
     for(size_t idx = 0; idx < session->count; idx++) {
         const CarBreakerFrame* frame = &session->frames[idx];
         const bool frame_valid = car_breaker_frame_is_valid(frame);
+
+        if(frame->hitag2_decoded && frame->hitag2_checksum_valid) {
+            if(!hitag2_uid_set) {
+                hitag2_uid = frame->hitag2_uid;
+                hitag2_uid_set = true;
+            }
+            if(frame->hitag2_uid == hitag2_uid) {
+                if(hitag2_sample_count == CAR_BREAKER_HITAG2_WINDOW) {
+                    memmove(
+                        &hitag2_samples[0],
+                        &hitag2_samples[1],
+                        (CAR_BREAKER_HITAG2_WINDOW - 1) * sizeof(CarBreakerHitag2Sample));
+                    hitag2_sample_count--;
+                }
+                hitag2_samples[hitag2_sample_count].keystream = frame->hitag2_keystream;
+                hitag2_samples[hitag2_sample_count].counter_low = frame->hitag2_counter_low;
+                hitag2_sample_count++;
+            }
+        }
 
         if(!updated.rolling_pwn_detected &&
            (idx + 1u) >= CAR_BREAKER_ROLLING_SEQUENCE_LEN &&
@@ -350,6 +674,47 @@ static void car_breaker_recompute_analysis_locked(CarBreakerApp* app) {
         }
     }
 
+    if(hitag2_sample_count >= CAR_BREAKER_HITAG2_MIN_SAMPLES) {
+        uint16_t hist[256] = {0};
+        bool keystream_repeat = false;
+        bool counter_regression = false;
+
+        for(size_t i = 0; i < hitag2_sample_count; i++) {
+            uint32_t ks = hitag2_samples[i].keystream;
+            for(uint8_t byte_idx = 0; byte_idx < 4; byte_idx++) {
+                uint8_t byte = (ks >> (byte_idx * 8)) & 0xFF;
+                hist[byte]++;
+            }
+
+            if(i > 0 && hitag2_samples[i].counter_low <= hitag2_samples[i - 1].counter_low) {
+                counter_regression = true;
+            }
+
+            for(size_t j = 0; j < i; j++) {
+                if(hitag2_samples[j].keystream == ks &&
+                   hitag2_samples[j].counter_low != hitag2_samples[i].counter_low) {
+                    keystream_repeat = true;
+                    break;
+                }
+            }
+        }
+
+        uint16_t total_bytes = hitag2_sample_count * 4;
+        float entropy = car_breaker_compute_entropy_bits_per_byte(hist, total_bytes);
+        updated.hitag2_activity = true;
+        updated.hitag2_uid = hitag2_uid;
+        updated.hitag2_window_size = hitag2_sample_count;
+        updated.hitag2_entropy_bits_per_byte = entropy;
+        updated.hitag2_entropy_low =
+            (entropy > 0.0f) && (entropy < CAR_BREAKER_HITAG2_ENTROPY_WARN);
+        updated.hitag2_entropy_critical =
+            (entropy > 0.0f) && (entropy < CAR_BREAKER_HITAG2_ENTROPY_CRIT);
+        updated.hitag2_keystream_repeat = keystream_repeat;
+        updated.hitag2_counter_regression = counter_regression;
+        updated.hitag2_last_counter = hitag2_samples[hitag2_sample_count - 1].counter_low;
+        updated.hitag2_last_keystream = hitag2_samples[hitag2_sample_count - 1].keystream;
+    }
+
     app->analysis = updated;
 }
 
@@ -368,14 +733,17 @@ static void car_breaker_finalize_frame_locked(CarBreakerApp* app) {
         session->count = CAR_BREAKER_MAX_FRAMES - 1;
     }
 
+    uint16_t recorded_pulses = app->pulse_count;
+
     CarBreakerFrame* frame = &session->frames[session->count++];
+    memset(frame, 0, sizeof(CarBreakerFrame));
     frame->timestamp_ms = furi_get_tick();
-    frame->pulse_count = app->pulse_count;
+    frame->pulse_count = recorded_pulses;
     frame->hash = car_breaker_hash_pulses(app->pulses, app->pulse_count);
     frame->preset_index = app->current_preset_index;
 
     uint64_t duration_sum = 0;
-    for(size_t i = 0; i < app->pulse_count; i++) {
+    for(size_t i = 0; i < recorded_pulses; i++) {
         duration_sum += app->pulses[i].duration;
     }
     if(duration_sum > UINT32_MAX) duration_sum = UINT32_MAX;
@@ -384,6 +752,8 @@ static void car_breaker_finalize_frame_locked(CarBreakerApp* app) {
     if(frame->approx_bits == 0) {
         frame->approx_bits = 1;
     }
+
+    car_breaker_try_decode_hitag2(frame, app->pulses, recorded_pulses);
 
     app->pulse_count = 0;
     app->capture_dirty = true;
@@ -424,11 +794,17 @@ static void car_breaker_update_capture_display(CarBreakerApp* app) {
     size_t frame_count = 0;
     CarBreakerAnalysis analysis = {0};
     bool capturing = false;
+    bool selection_ready = false;
+    CarBreakerRegion region = CarBreakerRegionUSA;
+    CarBreakerProfile profile = CarBreakerProfileHondaLegacy;
 
     furi_mutex_acquire(app->lock, FuriWaitForever);
     frame_count = app->session.count;
     analysis = app->analysis;
     capturing = app->capturing;
+    selection_ready = app->selection_ready;
+    region = app->selected_region;
+    profile = app->selected_profile;
     furi_mutex_release(app->lock);
 
     bool any_detected = analysis.static_code_detected ||
@@ -447,8 +823,17 @@ static void car_breaker_update_capture_display(CarBreakerApp* app) {
     size_t remaining = sizeof(app->capture_text);
     int written = 0;
 
-    // First line: Mode
-    written = snprintf(ptr, remaining, "Mode: %s\n", car_breaker_presets[app->current_preset_index].name);
+    if(selection_ready && region < COUNT_OF(car_breaker_region_names) &&
+       profile < COUNT_OF(car_breaker_profile_names)) {
+        written = snprintf(
+            ptr,
+            remaining,
+            "%s\n%s\n",
+            car_breaker_region_names[region],
+            car_breaker_profile_names[profile]);
+    } else {
+        written = snprintf(ptr, remaining, "Select target in menu\n");
+    }
     ptr += written;
     remaining -= written;
 
@@ -493,6 +878,43 @@ static void car_breaker_update_capture_display(CarBreakerApp* app) {
         }
     }
 
+    if(analysis.hitag2_activity && remaining > 0) {
+        written = snprintf(
+            ptr,
+            remaining,
+            "Mini UID:%08lX (%u)\n",
+            (unsigned long)analysis.hitag2_uid,
+            (unsigned)analysis.hitag2_window_size);
+        ptr += written;
+        remaining -= written;
+    }
+
+    if(analysis.hitag2_activity && remaining > 0) {
+        const char* entropy_label = analysis.hitag2_entropy_critical    ? "CRIT"
+                                     : analysis.hitag2_entropy_low     ? "LOW"
+                                     : "OK";
+        written = snprintf(
+            ptr,
+            remaining,
+            "KS H=%.2f (%s)\n",
+            (double)analysis.hitag2_entropy_bits_per_byte,
+            entropy_label);
+        ptr += written;
+        remaining -= written;
+    }
+
+    if(analysis.hitag2_keystream_repeat && remaining > 0) {
+        written = snprintf(ptr, remaining, "KS repeat detected!\n");
+        ptr += written;
+        remaining -= written;
+    }
+
+    if(analysis.hitag2_counter_regression && remaining > 0) {
+        written = snprintf(ptr, remaining, "Counter regression!\n");
+        ptr += written;
+        remaining -= written;
+    }
+
     dialog_ex_set_text(app->capture_dialog, app->capture_text, 64, 32, AlignCenter, AlignCenter);
 }
 
@@ -534,20 +956,15 @@ static void car_breaker_apply_preset(CarBreakerApp* app, uint8_t preset_idx) {
     app->capture_dirty = true;
 }
 
-static void car_breaker_hop_timer_callback(void* context) {
-    CarBreakerApp* app = context;
-    if(!app->capturing) return;
-
-    uint8_t next_idx = app->current_preset_index + 1;
-    if(next_idx >= CAR_BREAKER_PRESETS_COUNT) {
-        next_idx = 0;
+static void car_breaker_start_capture(CarBreakerApp* app) {
+    if(!app || app->capturing) return;
+    if(!app->selection_ready) {
+        app->pending_capture = true;
+        car_breaker_show_region_menu(app);
+        return;
     }
 
-    car_breaker_apply_preset(app, next_idx);
-}
-
-static void car_breaker_start_capture(CarBreakerApp* app) {
-    if(app->capturing) return;
+    app->pending_capture = false;
 
     car_breaker_update_status(app, "Listening...");
     dialog_ex_set_center_button_text(app->capture_dialog, "Stop");
@@ -559,27 +976,7 @@ static void car_breaker_start_capture(CarBreakerApp* app) {
     subghz_worker_set_pair_callback(app->worker, car_breaker_worker_pair_callback);
     subghz_worker_set_overrun_callback(app->worker, car_breaker_worker_overrun_callback);
 
-    if(app->mode == CarBreakerModeHopping) {
-        app->current_preset_index = 0;
-        car_breaker_apply_preset(app, app->current_preset_index);
-
-        if(!app->hop_timer) {
-            app->hop_timer =
-                furi_timer_alloc(car_breaker_hop_timer_callback, FuriTimerTypePeriodic, app);
-        }
-        furi_timer_start(app->hop_timer, furi_ms_to_ticks(CAR_BREAKER_HOP_INTERVAL_MS));
-    } else {
-        uint8_t preset_idx = car_breaker_get_preset_index(app->mode, app->filter);
-        app->current_preset_index = preset_idx;
-        const CarBreakerPreset* preset = &car_breaker_presets[preset_idx];
-        furi_hal_subghz_load_custom_preset(preset->regs);
-        furi_hal_subghz_set_frequency_and_path(preset->frequency);
-        furi_hal_subghz_flush_rx();
-        furi_hal_subghz_rx();
-
-        furi_hal_subghz_start_async_rx(subghz_worker_rx_callback, app->worker);
-        subghz_worker_start(app->worker);
-    }
+    car_breaker_apply_preset(app, app->current_preset_index);
 
     app->pulse_count = 0;
     app->capturing = true;
@@ -594,10 +991,7 @@ static void car_breaker_start_capture(CarBreakerApp* app) {
 
 static void car_breaker_stop_capture(CarBreakerApp* app) {
     if(!app->capturing) return;
-
-    if(app->hop_timer) {
-        furi_timer_stop(app->hop_timer);
-    }
+    app->pending_capture = false;
 
     if(subghz_worker_is_running(app->worker)) {
         subghz_worker_stop(app->worker);
@@ -653,37 +1047,6 @@ static uint32_t car_breaker_view_previous_callback(void* context) {
     return CarBreakerViewMenu;
 }
 
-static VariableItem* car_breaker_filter_item = NULL;
-
-static void car_breaker_config_mode_changed(VariableItem* item) {
-    CarBreakerApp* app = variable_item_get_context(item);
-    uint8_t index = variable_item_get_current_value_index(item);
-    if(index > CarBreakerMode315) index = CarBreakerModeHopping;
-    app->mode = index;
-    variable_item_set_current_value_text(item, car_breaker_mode_names[index]);
-
-    if(car_breaker_filter_item) {
-        if(index == CarBreakerModeHopping) {
-            variable_item_set_current_value_text(car_breaker_filter_item, "N/A");
-        } else {
-            variable_item_set_current_value_text(car_breaker_filter_item, car_breaker_filter_names[app->filter]);
-        }
-    }
-}
-
-static void car_breaker_config_filter_changed(VariableItem* item) {
-    CarBreakerApp* app = variable_item_get_context(item);
-    if(app->mode == CarBreakerModeHopping) {
-        variable_item_set_current_value_text(item, "N/A");
-        return;
-    }
-    uint8_t index = variable_item_get_current_value_index(item);
-    if(index > CarBreakerFilterNarrow) index = CarBreakerFilterWide;
-    app->filter = index;
-    variable_item_set_current_value_text(item, car_breaker_filter_names[index]);
-}
-
-
 static void car_breaker_splash_callback(DialogExResult result, void* context) {
     CarBreakerApp* app = context;
     UNUSED(result);
@@ -697,11 +1060,8 @@ static void car_breaker_submenu_callback(void* context, uint32_t index) {
 
     switch(index) {
     case CarBreakerMenuStart:
-        car_breaker_start_capture(app);
-        car_breaker_safe_switch_view(app, CarBreakerViewCapture);
-        break;
-    case CarBreakerMenuConfig:
-        car_breaker_safe_switch_view(app, CarBreakerViewConfig);
+        app->pending_capture = true;
+        car_breaker_show_region_menu(app);
         break;
     case CarBreakerMenuAbout:
         car_breaker_safe_switch_view(app, CarBreakerViewAbout);
@@ -717,9 +1077,13 @@ static CarBreakerApp* car_breaker_alloc(void) {
 
     app->lock = furi_mutex_alloc(FuriMutexTypeNormal);
     app->worker = subghz_worker_alloc();
-    app->mode = CarBreakerModeHopping;
-    app->filter = CarBreakerFilterWide;
     snprintf(app->status_message, sizeof(app->status_message), "Ready");
+    app->selected_region = CarBreakerRegionUSA;
+    app->selected_profile = CarBreakerProfileHondaModern;
+    app->current_preset_index =
+        car_breaker_select_preset_index(app->selected_region, app->selected_profile);
+    app->selection_ready = true;
+    app->pending_capture = false;
 
     app->gui = furi_record_open(RECORD_GUI);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
@@ -732,7 +1096,7 @@ static CarBreakerApp* car_breaker_alloc(void) {
     dialog_ex_set_header(app->splash_dialog, "Car Breaker 19", 64, 3, AlignCenter, AlignTop);
     dialog_ex_set_text(
         app->splash_dialog,
-        "Passive Honda RKE analyzer\nDetect Rolling-Pwn, RollBack,\nand static-code risks.",
+        "Passive Honda/Mini RKE\nRolling-Pwn / RollBack alerts\nHitag2 entropy warnings.",
         64,
         32,
         AlignCenter,
@@ -749,42 +1113,40 @@ static CarBreakerApp* car_breaker_alloc(void) {
     submenu_add_item(
         app->submenu, "Start Capture", CarBreakerMenuStart, car_breaker_submenu_callback, app);
     submenu_add_item(
-        app->submenu, "Config", CarBreakerMenuConfig, car_breaker_submenu_callback, app);
-    submenu_add_item(
         app->submenu, "About", CarBreakerMenuAbout, car_breaker_submenu_callback, app);
     view_set_previous_callback(submenu_get_view(app->submenu), car_breaker_menu_previous_callback);
     view_dispatcher_add_view(
         app->view_dispatcher, CarBreakerViewMenu, submenu_get_view(app->submenu));
 
-    app->config_list = variable_item_list_alloc();
-    variable_item_list_set_header(app->config_list, "Capture Options");
-
-    VariableItem* mode_item = variable_item_list_add(
-        app->config_list,
-        "Frequency",
-        3,
-        car_breaker_config_mode_changed,
-        app);
-    variable_item_set_current_value_index(mode_item, app->mode);
-    variable_item_set_current_value_text(mode_item, car_breaker_mode_names[app->mode]);
-
-    car_breaker_filter_item = variable_item_list_add(
-        app->config_list,
-        "Filter",
-        2,
-        car_breaker_config_filter_changed,
-        app);
-    variable_item_set_current_value_index(car_breaker_filter_item, app->filter);
-    if(app->mode == CarBreakerModeHopping) {
-        variable_item_set_current_value_text(car_breaker_filter_item, "N/A");
-    } else {
-        variable_item_set_current_value_text(car_breaker_filter_item, car_breaker_filter_names[app->filter]);
+    app->region_menu = submenu_alloc();
+    submenu_set_header(app->region_menu, "Region / Band");
+    for(uint32_t i = 0; i < COUNT_OF(car_breaker_region_names); i++) {
+        submenu_add_item(
+            app->region_menu,
+            car_breaker_region_names[i],
+            i,
+            car_breaker_region_menu_callback,
+            app);
     }
-
     view_set_previous_callback(
-        variable_item_list_get_view(app->config_list), car_breaker_view_previous_callback);
+        submenu_get_view(app->region_menu), car_breaker_region_previous_callback);
     view_dispatcher_add_view(
-        app->view_dispatcher, CarBreakerViewConfig, variable_item_list_get_view(app->config_list));
+        app->view_dispatcher, CarBreakerViewRegionSelect, submenu_get_view(app->region_menu));
+
+    app->profile_menu = submenu_alloc();
+    submenu_set_header(app->profile_menu, "Manufacturer Profile");
+    for(uint32_t i = 0; i < COUNT_OF(car_breaker_profile_names); i++) {
+        submenu_add_item(
+            app->profile_menu,
+            car_breaker_profile_names[i],
+            i,
+            car_breaker_profile_menu_callback,
+            app);
+    }
+    view_set_previous_callback(
+        submenu_get_view(app->profile_menu), car_breaker_profile_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher, CarBreakerViewProfileSelect, submenu_get_view(app->profile_menu));
 
     // Capture dialog
     app->capture_dialog = dialog_ex_alloc();
@@ -813,18 +1175,17 @@ static void car_breaker_free(CarBreakerApp* app) {
         furi_timer_free(app->ui_timer);
     }
 
-    if(app->hop_timer) {
-        furi_timer_free(app->hop_timer);
-    }
-
     view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewAbout);
     car_breaker19_scene_about_free(app->about_view);
 
     view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewCapture);
     dialog_ex_free(app->capture_dialog);
 
-    view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewConfig);
-    variable_item_list_free(app->config_list);
+    view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewProfileSelect);
+    submenu_free(app->profile_menu);
+
+    view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewRegionSelect);
+    submenu_free(app->region_menu);
 
     view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewMenu);
     submenu_free(app->submenu);

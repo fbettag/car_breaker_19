@@ -172,8 +172,8 @@ static void car_breaker19_scene_about_draw_callback(Canvas* canvas, void* contex
     canvas_draw_box(canvas, 18, 28, 92, 26);
     canvas_set_color(canvas, ColorBlack);
 
-    canvas_draw_str_aligned(canvas, 64, 33, AlignCenter, AlignCenter, "Honda RKE Analyzer");
-    canvas_draw_str_aligned(canvas, 64, 41, AlignCenter, AlignCenter, "Rolling-Pwn Detector");
+    canvas_draw_str_aligned(canvas, 64, 33, AlignCenter, AlignCenter, "Honda/Mini RKE Analyzer");
+    canvas_draw_str_aligned(canvas, 64, 41, AlignCenter, AlignCenter, "Rolling-Pwn + Hitag2");
 
     canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter, APP_VERSION_STR);
 }

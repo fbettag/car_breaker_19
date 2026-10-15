@@ -9,6 +9,8 @@
 
 Car Breaker 19 is a research-only, receive-only application that samples Honda RKE transmissions and flags risky behaviours such as Rolling-Pwn, RollBack, or static-code regressions. It shares the same UX philosophy as `uid_brute_smarter`: clear feedback, conservative defaults, and safeguards that keep the Flipper in passive sniffing mode at all times.
 
+The 2025 research push also broadens our passive telemetry goals beyond Honda: Car Breaker 19 now parses Mini Cooper R56/R60 Hitag2 frames (CAS3/CAS3+) to surface UID/counter/entropy diagnostics without ever transmitting. See [`RESEARCH.md`](RESEARCH.md#11-passive-cryptographic-analysis-of-mini-cooper-r56-hitag2-systems) for the methodology implemented in the latest release.
+
 > ⚠️ **IMPORTANT**: This tool exists solely to help owners and authorized researchers validate the security posture of vehicles they control. It does **not** transmit, jam, replay, or brute-force any signals and must never be used against systems without explicit, written authorization.
 
 ## ⚖️ Legal & Ethics
@@ -22,13 +24,14 @@ Car Breaker 19 is a research-only, receive-only application that samples Honda R
 
 ### Passive Capture Stack
 - Pre-loaded CC1101 presets (433.92 MHz & 315 MHz, wide/narrow) derived from Honda HND\_1 and HND\_2 register maps.
-- Channel hopping mode for unattended scans plus manual frequency/filter overrides.
+- Guided prompts ask for the target region (USA 315 MHz vs EU 433.92 MHz) and manufacturer profile (Honda legacy/modern or Mini CAS3) so the right preset is armed automatically.
 - Watchdog timers and mutex-protected buffers prevent UI freezes while processing dense pulse trains.
 
 ### Detection Engines
 - **Rolling-Pwn heuristic** – requires ≥5 unique frames within 2.5 s, each 3–14 ms long (≈40–160 Manchester bits) and waveform-consistent before raising an alert.
 - **RollBack suspicion** – triggers when an identical frame reappears after ≥8 s, signalling counter reset or resynchronization abuse.
 - **Static-code detection** – flags repeated hashes that are still within the nominal sliding window, indicating CVE-2022-27254-style fixed commands.
+- **Mini Hitag2 entropy monitor** – decodes 104-bit Mini frames (UID, CNTRL, MAC) and scores their Shannon entropy so CAS3/CAS3+ owners can spot weak keystream generators or counter regressions with zero RF transmission.
 - Status dialog shows the active preset, running frame count, and live alert state without interrupting capture.
 
 ### Safer UX
@@ -62,7 +65,7 @@ git clone https://github.com/fbettag/car_breaker_19.git applications_user/car_br
 
 ### Using the App
 1. Open `Apps → Sub-GHz → Car Breaker 19`.
-2. Select `Start Capture`. The app begins in hopping mode; switch to 433 MHz or 315 MHz manually if you already know the fob region.
+2. Select `Start Capture`, then answer the prompts for region (USA 315 MHz or EU 433.92 MHz) and manufacturer profile (Honda legacy/modern or Mini CAS3) so the radio locks to the proper preset.
 3. Leave the Flipper near the target vehicle/fob. Alerts appear inline on the scan screen; press `Stop` to exit and reset the session.
 
 ## 🧪 Detection Methodology
@@ -78,6 +81,7 @@ All thresholds are derived from the timing, baud-rate, and FSK deviation analysi
 ## 📖 Research Notes
 
 - [`RESEARCH.md`](RESEARCH.md) aggregates the Honda RKE background, preset math, and external references (Rolling-Pwn, RollBack, static code CVEs).
+- Section 11 of the research file documents the Mini Cooper (R56/R60) Hitag2 passive-audit workflow implemented here—covering CAS3 architecture, PCF79xx transponders, 104-bit frame parsing, entropy metrics, and a Flipper-based checklist for expanding Car Breaker 19 beyond Honda.
 - The app never bundles exploit payloads—only detection baselines aligned with the documented physics layer.
 
 ## 🤝 Support & Feedback
