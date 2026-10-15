@@ -5,5 +5,8 @@ App(
     entry_point="car_breaker19_app",
     requires=["gui", "storage"],
     fap_category="Research",
+    fap_description="Honda/Mini RKE analyzer: passive rolling-code detection plus guided owner self-audit",
+    fap_author="fbettag",
+    fap_version="1.2",
     sources=["car_breaker19.c", "car_breaker_audit.c", "scenes/car_breaker19_scene_about.c", "version.c"],
 )
