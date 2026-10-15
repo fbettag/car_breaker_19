@@ -714,3 +714,38 @@ Table 2: Passive Analysis Checklist for Flipper Zero
 | Frame Structure | Custom Hitag2 Decoder | Decodes to valid UID/BTN/CNTR | Fails CRC/Checksum repeatedly |
 | Rolling Code | Custom Hitag2 Decoder | Counter increments by 1 or small steps | Counter static (Replay/Fixed Code) |
 | Entropy | Entropy Analyzer Plugin | High entropy in KS field ($>7.5$ bits/byte) | Repeating patterns or low entropy ($<7.0$) |
+## **12. Guided Audit: Owner-Side Verification via Bounded Session Replay**
+
+### Motivation
+
+Passive detection tells an owner that *risky-looking traffic exists*; it cannot tell them whether their specific vehicle *accepts* stale or out-of-range rolling codes. The 2025 systematization of RKE attacks (arXiv 2505.02713) shows replay-family weaknesses (Rolling-Pwn, RollBack) remain unpatched across large model ranges, and that owners have no practical way to check their own car. Car Breaker 19 v1.2 closes that gap with three opt-in transmit tests that mirror the published attack mechanisms, scoped to self-audit.
+
+### Test Design
+
+| Test | Mechanism verified | Capture protocol | Replay protocol | Positive signal |
+| --- | --- | --- | --- | --- |
+| Static Code | Fixed unlock codes (CVE-2022-27254 class) | 1 frame, used normally | 1 replay after an enforced 30 s settle | car reacts to the replay |
+| RollBack | Replay-induced counter resync (arXiv 2210.11923, ACM TCPS 2024) | 5 frames used normally near the car | consecutive burst of the 3 oldest captured frames, 400 ms pacing | car resynchronizes (reacts) after the burst |
+| Rolling-Pwn | Previous-cycle code acceptance (CVE-2021-46145 class) | 10 presses with the fob out of vehicle range, so codes remain unused | up to 5 unused codes replayed individually, user observes after each | car reacts to any unused code |
+
+A reaction is defined as the user observing an unlock, lock, or indicator flash. The verdict distinguishes VULNERABLE (mechanism confirmed), NOT DETECTED (no reaction in scope; not a proof of safety), and INCONCLUSIVE (capture insufficient or TX refused).
+
+### Safeguard Model
+
+1. **Authorization gate**: every audit starts with an explicit ownership/authorization acknowledgment.
+2. **Session-only frames**: the TX path draws exclusively from the in-RAM retention ring (10 frames, raw signed durations); there is no file import into the transmit path. `.sub` export exists, replay-from-file does not.
+3. **Bounded replays**: hard cap of 5 transmissions per test; the RollBack burst is fixed at 3.
+4. **No jamming**: RollJam-style tests are deliberately out of scope; they require active interference and are illegal in most jurisdictions.
+5. **Regulation respected**: if the firmware's regional TX lock refuses transmission, the audit reports it as blocked rather than bypassing.
+6. **Audit trail**: every step (captures, replays, verdict) is logged to `/ext/apps_data/car_breaker19/audit_<epoch>.txt` for insurance or disclosure use.
+
+### Technical Path
+
+Captured `LevelDuration` pulse trains are retained as RAW_Data-compatible signed durations alongside the frame hash. Transmission uses `furi_hal_subghz_start_async_tx` with a yield callback that walks the retained array, reusing the exact CC1101 custom preset (HND1/HND2 register maps) the frame was captured with, so the replay is a faithful RF copy rather than a re-modulation. Exported `.sub` files embed the same custom preset, so the stock Sub-GHz app can play them for independent verification.
+
+### Relationship to Published Research
+
+- RollBack: T. Bianchi et al. underlying mechanism per arXiv 2210.11923; the audit replays previously used codes consecutively exactly as described.
+- Rolling-Pwn: Kevin2600's disclosure for Honda/Acura 2012-2022; the audit uses the documented ~10-consecutive-press capture protocol.
+- Static codes: CVE-2022-27254 (Honda); the settle delay prevents a still-fresh rolling code from masking a fixed-code result.
+- Hitag2 exposure advisory: when 4+ checksum-valid frames from one Mini CAS3 UID are seen, the passive screen flags the published correlation-attack precondition (arXiv 2505.02713, "Lock It and Still Lose It" lineage).

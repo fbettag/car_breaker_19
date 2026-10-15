@@ -7,11 +7,11 @@
 
 ## 🎯 Overview
 
-Car Breaker 19 is a research-only, receive-only application that samples Honda RKE transmissions and flags risky behaviours such as Rolling-Pwn, RollBack, or static-code regressions. It shares the same UX philosophy as `uid_brute_smarter`: clear feedback, conservative defaults, and safeguards that keep the Flipper in passive sniffing mode at all times.
+Car Breaker 19 is a research application that samples Honda RKE transmissions and flags risky behaviours such as Rolling-Pwn, RollBack, or static-code regressions. It shares the same UX philosophy as `uid_brute_smarter`: clear feedback, conservative defaults, and safeguards. Passive analysis remains the default mode; the optional **Guided Audit** additionally lets owners verify their own vehicle by replaying signals captured moments earlier in the same session.
 
 The 2025 research push also broadens our passive telemetry goals beyond Honda: Car Breaker 19 now parses Mini Cooper R56/R60 Hitag2 frames (CAS3/CAS3+) to surface UID/counter/entropy diagnostics without ever transmitting. See [`RESEARCH.md`](RESEARCH.md#11-passive-cryptographic-analysis-of-mini-cooper-r56-hitag2-systems) for the methodology implemented in the latest release.
 
-> ⚠️ **IMPORTANT**: This tool exists solely to help owners and authorized researchers validate the security posture of vehicles they control. It does **not** transmit, jam, replay, or brute-force any signals and must never be used against systems without explicit, written authorization.
+> ⚠️ **IMPORTANT**: This tool exists solely to help owners and authorized researchers validate the security posture of vehicles they control. Passive capture never transmits. The Guided Audit transmits **only** frames captured in the current session, requires an explicit authorization acknowledgment, bounds every replay count, and never jams. It must never be used against systems without explicit, written authorization.
 
 ## ⚖️ Legal & Ethics
 
@@ -38,6 +38,26 @@ The 2025 research push also broadens our passive telemetry goals beyond Honda: C
 - Splash screen reminds users that this is a defensive research tool.
 - Capture dialog is one button (`Stop`) to avoid accidental mode switches.
 - Detection logic tolerates RF noise by rejecting frames outside expected Honda RKE timing envelopes before computing hashes.
+
+### 🧪 Guided Audit (opt-in transmit)
+
+Three owner-side tests mirror published attack mechanisms so a vehicle owner can determine whether their own car is affected. Every test replays **only** raw frames captured earlier in the same session and requires an explicit authorization acknowledgment first.
+
+| Test | Procedure | Finding |
+| --- | --- | --- |
+| Static Code | Capture one used unlock, enforced 30 s settle delay, single replay | Car reacts → fixed codes (CVE-2022-27254 class) |
+| RollBack | Capture ~5 normally used codes, consecutive replay burst of the oldest 3 | Car resyncs → replay-induced counter rollback (arXiv 2210.11923) |
+| Rolling-Pwn | Capture ~10 presses out of vehicle range, replay unused codes one at a time | Any reaction → previous-cycle codes accepted (CVE-2021-46145 class) |
+
+Safeguards: authorization gate, session-only frames (no file import), bounded replay counts (max 5), per-test frequency confirmation display, no jamming, and a verdict screen with an exportable audit log (`/ext/apps_data/car_breaker19/`). Replays that the firmware's regional TX lock refuses are reported as blocked, not bypassed.
+
+### 📚 Known Issues Lookup
+
+A metadata table of documented RKE weaknesses (Rolling-Pwn, RollBack, Hitag2 cryptanalysis, telematics API flaws) from the 2025 systematization of knowledge (arXiv 2505.02713), browsable per manufacturer so owners can check whether their model generation is already on record.
+
+### 💾 Session Export
+
+Every retained raw frame can be written as a stock-compatible `.sub` file (custom CC1101 preset included) for offline analysis or playback in the stock Sub-GHz app.
 
 ## 🚀 Quick Start
 
@@ -67,6 +87,8 @@ git clone https://github.com/fbettag/car_breaker_19.git applications_user/car_br
 1. Open `Apps → Sub-GHz → Car Breaker 19`.
 2. Select `Start Capture`, then answer the prompts for region (USA 315 MHz or EU 433.92 MHz) and manufacturer profile (Honda legacy/modern or Mini CAS3) so the radio locks to the proper preset.
 3. Leave the Flipper near the target vehicle/fob. Alerts appear inline on the scan screen; press `Stop` to exit and reset the session.
+4. For an active self-audit, select `Guided Audit (TX)` instead, pick a test, and follow the step-by-step prompts. The verdict and full audit log land in `/ext/apps_data/car_breaker19/`.
+5. `Known Issues` browses documented manufacturer weaknesses; `Export Session` writes all retained raw frames as `.sub` files.
 
 ## 🧪 Detection Methodology
 

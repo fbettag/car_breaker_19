@@ -1,1 +1,1 @@
-const char* APP_VERSION_STR = "v1.1";
+const char* APP_VERSION_STR = "v1.2";
